@@ -246,15 +246,22 @@ static HRESULT WINAPI x_user_XUserAddAsync( IXUserImpl *iface, XUserAddOptions o
 {
     struct XUserAddContext *context;
     IXThreadingImpl *impl;
+    HRESULT hr;
 
     TRACE( "iface %p, options %d, asyncBlock %p\n", iface, options, asyncBlock );
 
     if (!asyncBlock) return E_POINTER;
-    if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_NOTIMPL;
-    if (!(context = calloc( 1, sizeof( struct XUserAddContext ) ))) return E_OUTOFMEMORY;
-    context->options = options;
+    if (FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return hr;
+    if (!(context = calloc( 1, sizeof( struct XUserAddContext ) )))
+    {
+        impl->lpVtbl->Release( impl );
+        return E_OUTOFMEMORY;
+    }
 
-    return impl->lpVtbl->XAsyncBegin( impl, asyncBlock, context, x_user_XUserAddAsync, "XUserAddAsync", XUserAddProvider );
+    context->options = options;
+    hr = impl->lpVtbl->XAsyncBegin( impl, asyncBlock, context, x_user_XUserAddAsync, "XUserAddAsync", XUserAddProvider );
+    impl->lpVtbl->Release( impl );
+    return hr;
 }
 
 static HRESULT WINAPI x_user_XUserAddResult( IXUserImpl *iface, XAsyncBlock *asyncBlock, XUserHandle *user )
@@ -420,12 +427,18 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureAsync( IXUserImpl *iface, 
 {
     struct XUserGetTokenAndSignatureContext *context;
     IXThreadingImpl *impl;
+    HRESULT hr;
 
     TRACE( "iface %p, user %p, options %d, method %s, url %s, count %llu, headers %p, size %llu, buffer %p, asyncBlock %p\n", iface, user, options, method, url, count, headers, size, buffer, asyncBlock );
 
     if (!user || !method || !url || !headers || !buffer || !asyncBlock) return E_POINTER;
-    if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_NOTIMPL;
-    if (!(context = calloc( 1, sizeof( *context ) ))) return E_OUTOFMEMORY;
+    if (FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return hr;
+    if (!(context = calloc( 1, sizeof( *context ) )))
+    {
+        impl->lpVtbl->Release( impl );
+        return E_OUTOFMEMORY;
+    }
+
     context->options = options;
     context->buffer = buffer;
     context->method = method;
@@ -437,13 +450,16 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureAsync( IXUserImpl *iface, 
     if (count && !(context->headers = calloc( count, sizeof( *headers ) )))
     {
         free( context );
+        impl->lpVtbl->Release( impl );
         return E_OUTOFMEMORY;
     }
 
     for (SIZE_T i = 0; i < count; i++)
         context->headers[i] = headers[i];
 
-    return impl->lpVtbl->XAsyncBegin( impl, asyncBlock, context, x_user_XUserGetTokenAndSignatureAsync, "XUserGetTokenAndSignatureAsync", XUserGetTokenAndSignatureProvider );
+    hr = impl->lpVtbl->XAsyncBegin( impl, asyncBlock, context, x_user_XUserGetTokenAndSignatureAsync, "XUserGetTokenAndSignatureAsync", XUserGetTokenAndSignatureProvider );
+    impl->lpVtbl->Release( impl );
+    return hr;
 }
 
 static HRESULT WINAPI x_user_XUserGetTokenAndSignatureResultSize( IXUserImpl *iface, XAsyncBlock *asyncBlock, SIZE_T *size )
@@ -462,12 +478,18 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Async( IXUserImpl *if
 {
     struct XUserGetTokenAndSignatureContext *context;
     IXThreadingImpl *impl;
+    HRESULT hr;
 
     TRACE( "iface %p, user %p, options %d, method %hs, url %hs, count %llu, headers %p, size %llu, buffer %p, asyncBlock %p\n", iface, user, options, method, url, count, headers, size, buffer, asyncBlock );
 
     if (!user || !method || !url || !headers || !buffer || !asyncBlock) return E_POINTER;
-    if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_NOTIMPL;
-    if (!(context = calloc( 1, sizeof( *context ) ))) return E_OUTOFMEMORY;
+    if (FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return hr;
+    if (!(context = calloc( 1, sizeof( *context ) )))
+    {
+        impl->lpVtbl->Release( impl );
+        return E_OUTOFMEMORY;
+    }
+
     context->method_utf16 = method;
     context->options = options;
     context->buffer = buffer;
@@ -479,13 +501,16 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Async( IXUserImpl *if
     if (count && !(context->headers_utf16 = calloc( count, sizeof( *headers ) )))
     {
         free( context );
+        impl->lpVtbl->Release( impl );
         return E_OUTOFMEMORY;
     }
 
     for (SIZE_T i = 0; i < count; i++)
         context->headers_utf16[i] = headers[i];
 
-    return impl->lpVtbl->XAsyncBegin( impl, asyncBlock, context, x_user_XUserGetTokenAndSignatureUtf16Async, "XUserGetTokenAndSignatureUtf16Async", XUserGetTokenAndSignatureProvider );
+    hr = impl->lpVtbl->XAsyncBegin( impl, asyncBlock, context, x_user_XUserGetTokenAndSignatureUtf16Async, "XUserGetTokenAndSignatureUtf16Async", XUserGetTokenAndSignatureProvider );
+    impl->lpVtbl->Release( impl );
+    return hr;
 }
 
 static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16ResultSize( IXUserImpl *iface, XAsyncBlock *asyncBlock, SIZE_T *size )
