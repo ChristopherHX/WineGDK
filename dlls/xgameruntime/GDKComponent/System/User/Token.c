@@ -818,11 +818,15 @@ HRESULT RequestUserToken( HSTRING oauth_token, HSTRING *token, XUserLocalId *loc
     HRESULT hr;
 
     if (FAILED( hr = HSTRINGToMultiByte( oauth_token, &token_str, &token_str_len ) ))
+    {
+        FIXME( "RequestUserToken HSTRINGToMultiByte returned %#lx\n", hr );
         return hr;
+    }
 
     if (!(data = calloc( strlen( template ) + token_str_len + strlen( "\"}}" ) + 1, sizeof( CHAR ) )))
     {
         free( token_str );
+        FIXME( "RequestUserToken request allocation returned %#lx\n", E_OUTOFMEMORY );
         return E_OUTOFMEMORY;
     }
 
@@ -843,14 +847,23 @@ HRESULT RequestUserToken( HSTRING oauth_token, HSTRING *token, XUserLocalId *loc
     );
 
     free( data );
-    if (FAILED( hr )) return hr;
+    if (FAILED( hr ))
+    {
+        FIXME( "RequestUserToken HttpRequest returned %#lx\n", hr );
+        return hr;
+    }
     hr = ParseJsonObject( buffer, size, &object );
     free( buffer );
-    if (FAILED( hr )) return hr;
+    if (FAILED( hr ))
+    {
+        FIXME( "RequestUserToken ParseJsonObject returned %#lx\n", hr );
+        return hr;
+    }
 
     if (FAILED( hr = GetJsonStringValue( object, L"Token", token ) ))
     {
         IJsonObject_Release( object );
+        FIXME( "RequestUserToken Token field returned %#lx\n", hr );
         return hr;
     }
 
@@ -859,6 +872,7 @@ HRESULT RequestUserToken( HSTRING oauth_token, HSTRING *token, XUserLocalId *loc
     if (FAILED( hr ))
     {
         WindowsDeleteString( *token );
+        FIXME( "RequestUserToken DisplayClaims returned %#lx\n", hr );
         return hr;
     }
 
@@ -867,6 +881,7 @@ HRESULT RequestUserToken( HSTRING oauth_token, HSTRING *token, XUserLocalId *loc
     if (FAILED( hr ))
     {
         WindowsDeleteString( *token );
+        FIXME( "RequestUserToken xui returned %#lx\n", hr );
         return hr;
     }
 
@@ -875,6 +890,7 @@ HRESULT RequestUserToken( HSTRING oauth_token, HSTRING *token, XUserLocalId *loc
     if (FAILED( hr ))
     {
         WindowsDeleteString( *token );
+        FIXME( "RequestUserToken xui[0] returned %#lx\n", hr );
         return hr;
     }
 
@@ -883,6 +899,7 @@ HRESULT RequestUserToken( HSTRING oauth_token, HSTRING *token, XUserLocalId *loc
     if (FAILED( hr ))
     {
         WindowsDeleteString( *token );
+        FIXME( "RequestUserToken uhs returned %#lx\n", hr );
         return hr;
     }
 
@@ -891,6 +908,7 @@ HRESULT RequestUserToken( HSTRING oauth_token, HSTRING *token, XUserLocalId *loc
     if (FAILED( hr ))
     {
         WindowsDeleteString( *token );
+        FIXME( "RequestUserToken uhs conversion returned %#lx\n", hr );
         return hr;
     }
 
@@ -900,9 +918,11 @@ HRESULT RequestUserToken( HSTRING oauth_token, HSTRING *token, XUserLocalId *loc
     {
         WindowsDeleteString( *token );
         errno = 0;
+        FIXME( "RequestUserToken local id parse returned %#lx\n", E_FAIL );
         return E_FAIL;
     }
 
+    FIXME( "RequestUserToken returning %#lx\n", hr );
     return hr;
 }
 
