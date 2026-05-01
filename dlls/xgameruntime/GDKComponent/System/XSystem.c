@@ -88,13 +88,14 @@ static HRESULT WINAPI x_system_XSystemGetXboxLiveSandboxId( IXSystemImpl *iface,
 
     TRACE( "iface %p, sandboxIdSize %d, sandboxId %p, sandboxIdUsed %p\n", iface, sandboxIdSize, sandboxId, sandboxIdUsed );
 
-    if ( !sandboxId || !sandboxIdUsed )
+    if ( !sandboxId )
         return E_POINTER;
 
     if ( sandboxIdSize < XSystemXboxLiveSandboxIdMaxBytes )
         return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
 
     strcpy_s( sandboxId, sandboxIdSize, Id );
+    if(sandboxIdUsed)
     *sandboxIdUsed = strlen( Id ) + 1;
     return S_OK;
 }
