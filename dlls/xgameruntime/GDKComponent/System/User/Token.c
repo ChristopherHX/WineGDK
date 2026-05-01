@@ -20,6 +20,10 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 
+#define TOKEN_STORE_REG_KEY "Software\\Wine\\WineGDK\\XUser"
+#define TOKEN_STORE_CLIENT_ID_VALUE "ClientId"
+#define TOKEN_STORE_REFRESH_TOKEN_VALUE "RefreshToken"
+
 #define GetJsonValue( obj_type, ret_type )                                                          \
 static inline HRESULT GetJson##obj_type##Value( IJsonObject *object, LPCWSTR key, ret_type value )  \
 {                                                                                                   \
@@ -357,6 +361,93 @@ static HRESULT CreateHStringFromUtf8( LPCSTR str, HSTRING *hstr )
     return hr;
 }
 
+static HRESULT LoadRegistryStringHString( HKEY key, LPCSTR name, HSTRING *value )
+{
+    char *buffer;
+    DWORD type, size = 0;
+    LSTATUS status;
+    HRESULT hr;
+
+    *value = NULL;
+
+    status = RegQueryValueExA( key, name, NULL, &type, NULL, &size );
+    if (status != ERROR_SUCCESS) return HRESULT_FROM_WIN32( status );
+    if (type != REG_SZ || !size) return E_INVALIDARG;
+    if (!(buffer = calloc( size + 1, sizeof( CHAR ) ))) return E_OUTOFMEMORY;
+
+    status = RegQueryValueExA( key, name, NULL, &type, (BYTE *)buffer, &size );
+    if (status == ERROR_SUCCESS && type == REG_SZ)
+        hr = CreateHStringFromUtf8( buffer, value );
+    else
+        hr = status == ERROR_SUCCESS ? E_INVALIDARG : HRESULT_FROM_WIN32( status );
+
+    free( buffer );
+    return hr;
+}
+
+static HRESULT LoadTokenStoreFromRegistry( HSTRING *client_id, HSTRING *refresh_token )
+{
+    HKEY key;
+    LSTATUS status;
+    HRESULT hr;
+
+    *client_id = NULL;
+    *refresh_token = NULL;
+
+    status = RegOpenKeyExA( HKEY_CURRENT_USER, TOKEN_STORE_REG_KEY, 0, KEY_READ, &key );
+    if (status != ERROR_SUCCESS) return E_GAMEUSER_NO_DEFAULT_USER;
+
+    hr = LoadRegistryStringHString( key, TOKEN_STORE_CLIENT_ID_VALUE, client_id );
+    if (SUCCEEDED( hr ))
+        hr = LoadRegistryStringHString( key, TOKEN_STORE_REFRESH_TOKEN_VALUE, refresh_token );
+    RegCloseKey( key );
+    if (FAILED( hr ))
+    {
+        if (*client_id) WindowsDeleteString( *client_id );
+        if (*refresh_token) WindowsDeleteString( *refresh_token );
+        *client_id = NULL;
+        *refresh_token = NULL;
+        return E_GAMEUSER_NO_DEFAULT_USER;
+    }
+
+    return S_OK;
+}
+
+static HRESULT SaveTokenStoreToRegistry( LPCSTR client_id, LPCSTR refresh_token )
+{
+    HKEY key;
+    LSTATUS status;
+
+    status = RegCreateKeyExA( HKEY_CURRENT_USER, TOKEN_STORE_REG_KEY, 0, NULL, REG_OPTION_NON_VOLATILE,
+                              KEY_READ | KEY_WRITE, NULL, &key, NULL );
+    if (status != ERROR_SUCCESS) return HRESULT_FROM_WIN32( status );
+
+    status = RegSetValueExA( key, TOKEN_STORE_CLIENT_ID_VALUE, 0, REG_SZ, (const BYTE *)client_id, strlen( client_id ) + 1 );
+    if (status == ERROR_SUCCESS)
+        status = RegSetValueExA( key, TOKEN_STORE_REFRESH_TOKEN_VALUE, 0, REG_SZ, (const BYTE *)refresh_token, strlen( refresh_token ) + 1 );
+    RegCloseKey( key );
+
+    return status == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32( status );
+}
+
+HRESULT SaveTokenStoreRefreshToken( HSTRING client_id_hstr, HSTRING refresh_token_hstr )
+{
+    LPSTR client_id = NULL, refresh_token = NULL;
+    HRESULT hr;
+
+    if (FAILED( hr = HStringToNulString( client_id_hstr, &client_id ) )) return hr;
+    if (FAILED( hr = HStringToNulString( refresh_token_hstr, &refresh_token ) ))
+    {
+        free( client_id );
+        return hr;
+    }
+
+    hr = SaveTokenStoreToRegistry( client_id, refresh_token );
+    free( client_id );
+    free( refresh_token );
+    return hr;
+}
+
 static HRESULT HttpRequestWithStatus( LPCWSTR method, LPCWSTR domain, LPCWSTR object, LPCSTR data, LPCWSTR headers, LPSTR *buffer, SIZE_T *bufferSize, DWORD *status )
 {
     HINTERNET connection = NULL, session = NULL, request = NULL;
@@ -427,6 +518,8 @@ HRESULT LoadTokenStore( LPCSTR path, HSTRING *client_id, HSTRING *refresh_token 
     *client_id = NULL;
     *refresh_token = NULL;
 
+    if (SUCCEEDED( LoadTokenStoreFromRegistry( client_id, refresh_token ) )) return S_OK;
+
     if (FAILED( hr = ReadFileBytesA( path, &buffer, &size ) )) return E_GAMEUSER_NO_DEFAULT_USER;
     hr = ParseJsonObject( buffer, size, &root );
     free( buffer );
@@ -443,6 +536,7 @@ HRESULT LoadTokenStore( LPCSTR path, HSTRING *client_id, HSTRING *refresh_token 
     if (FAILED( hr )) goto failed;
 
     IJsonObject_Release( root );
+    SaveTokenStoreRefreshToken( *client_id, *refresh_token );
     return S_OK;
 
 failed:
@@ -523,6 +617,9 @@ HRESULT LoadClientIdFromGameConfig( HSTRING *client_id )
 static HRESULT SaveTokenStore( LPCSTR path, LPCSTR client_id, LPCSTR access_token, LPCSTR refresh_token, DWORD expires_in, LPCSTR scope, LPCSTR token_type )
 {
     FILE *file;
+    HRESULT hr;
+
+    if (SUCCEEDED( hr = SaveTokenStoreToRegistry( client_id, refresh_token ) )) return S_OK;
 
     if (!(file = fopen( path, "wb" ))) return HRESULT_FROM_WIN32( GetLastError() );
     fprintf( file,

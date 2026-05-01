@@ -207,6 +207,7 @@ BOOL WINAPI WinHttpCrackUrl( const WCHAR *url, DWORD len, DWORD flags, URL_COMPO
     }
     if (!(p = wcschr( url, ':' )))
     {
+        FIXME("ERROR_WINHTTP_UNRECOGNIZED_SCHEME: %s\n", url);
         SetLastError( ERROR_WINHTTP_UNRECOGNIZED_SCHEME );
         free( url_transformed );
         return FALSE;
@@ -215,6 +216,7 @@ BOOL WINAPI WinHttpCrackUrl( const WCHAR *url, DWORD len, DWORD flags, URL_COMPO
     else if (p - url == 5 && !wcsnicmp( url, L"https", 5 )) scheme_number = INTERNET_SCHEME_HTTPS;
     else
     {
+        FIXME("ERROR_WINHTTP_UNRECOGNIZED_SCHEME: %s\n", url);
         err = ERROR_WINHTTP_UNRECOGNIZED_SCHEME;
         goto exit;
     }

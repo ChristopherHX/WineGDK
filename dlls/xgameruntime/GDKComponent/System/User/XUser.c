@@ -36,9 +36,10 @@ static SRWLOCK default_user_lock = SRWLOCK_INIT;
 
 #define XUSER_SIGNATURE_POLICY_VERSION 1
 #define XUSER_SIGNATURE_MAX_BODY_BYTES 8192
+#define XUSER_STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xc0000023)
 
-#undef TRACE
-#define TRACE FIXME
+// #undef TRACE
+// #define TRACE FIXME
 
 static void x_user_free_members( struct x_user *impl )
 {
@@ -172,6 +173,7 @@ static HRESULT refresh_user_tokens( struct x_user *impl, BOOL force )
     }
     impl->oauth_token_expiry = expiry;
 
+    if (FAILED( hr = SaveTokenStoreRefreshToken( impl->client_id, impl->refresh_token ) )) return hr;
     return create_authorization_header( impl );
 
 failed:
@@ -666,6 +668,7 @@ static HRESULT sign_request( struct x_user *user, LPCSTR method, LPCWSTR url, co
     if (FAILED( hr = sha256_hash( message, message_size, hash ) )) goto done;
     if ((status = BCryptSignHash( user->signing_key, NULL, hash, sizeof( hash ), NULL, 0, &sig_size, 0 )))
     {
+        FIXME( "BCryptSignHash size query failed %#lx, sig_size %lu\n", status, sig_size );
         hr = HRESULT_FROM_NT( status );
         goto done;
     }
@@ -676,8 +679,35 @@ static HRESULT sign_request( struct x_user *user, LPCSTR method, LPCWSTR url, co
     }
     if ((status = BCryptSignHash( user->signing_key, NULL, hash, sizeof( hash ), sig, sig_size, &sig_size, 0 )))
     {
-        hr = HRESULT_FROM_NT( status );
-        goto done;
+        if (status == XUSER_STATUS_BUFFER_TOO_SMALL)
+        {
+            BYTE *new_sig;
+
+            FIXME( "BCryptSignHash retrying with sig_size %lu\n", sig_size );
+            if (!(new_sig = realloc( sig, sig_size )))
+            {
+                hr = E_OUTOFMEMORY;
+                goto done;
+            }
+            sig = new_sig;
+            if (!(blob = realloc( blob, sizeof( version ) + sizeof( timestamp ) + sig_size )))
+            {
+                hr = E_OUTOFMEMORY;
+                goto done;
+            }
+            if ((status = BCryptSignHash( user->signing_key, NULL, hash, sizeof( hash ), sig, sig_size, &sig_size, 0 )))
+            {
+                FIXME( "BCryptSignHash retry failed %#lx, sig_size %lu\n", status, sig_size );
+                hr = HRESULT_FROM_NT( status );
+                goto done;
+            }
+        }
+        else
+        {
+            FIXME( "BCryptSignHash failed %#lx, sig_size %lu\n", status, sig_size );
+            hr = HRESULT_FROM_NT( status );
+            goto done;
+        }
     }
     memcpy( blob, version, sizeof( version ) );
     memcpy( blob + sizeof( version ), timestamp, sizeof( timestamp ) );
@@ -754,21 +784,78 @@ static HRESULT token_context_prepare_result( struct XUserGetTokenAndSignatureCon
     HRESULT hr;
 
     if (FAILED( hr = refresh_user_tokens( user, context->options & XUserGetTokenAndSignatureOptions_ForceRefresh ) ))
+    {
+        FIXME( "refresh_user_tokens failed %#lx\n", hr );
         return hr;
+    }
 
-    if (!(context->token = strdup( user->authorization ? user->authorization : "" ))) return E_OUTOFMEMORY;
+    if (!(context->token = strdup( user->authorization ? user->authorization : "" )))
+    {
+        FIXME( "token strdup failed\n" );
+        return E_OUTOFMEMORY;
+    }
+
+    if ((!context->utf16 && !context->url[0]) || (context->utf16 && !context->url_utf16[0]))
+    {
+        FIXME( "token-only request, utf16 %u\n", context->utf16 );
+        if (!(context->signature = strdup( "" )))
+        {
+            FIXME( "empty signature strdup failed\n" );
+            return E_OUTOFMEMORY;
+        }
+        if (context->utf16)
+        {
+            int token_len = MultiByteToWideChar( CP_UTF8, 0, context->token, -1, NULL, 0 );
+            int sig_len = MultiByteToWideChar( CP_UTF8, 0, context->signature, -1, NULL, 0 );
+            if (!token_len || !sig_len)
+            {
+                hr = HRESULT_FROM_WIN32( GetLastError() );
+                FIXME( "token-only utf16 length conversion failed %#lx\n", hr );
+                return hr;
+            }
+            if (!(context->token_utf16 = calloc( token_len, sizeof( WCHAR ) ))) return E_OUTOFMEMORY;
+            if (!MultiByteToWideChar( CP_UTF8, 0, context->token, -1, context->token_utf16, token_len ))
+            {
+                hr = HRESULT_FROM_WIN32( GetLastError() );
+                FIXME( "token-only token utf16 conversion failed %#lx\n", hr );
+                return hr;
+            }
+            if (!(context->signature_utf16 = calloc( sig_len, sizeof( WCHAR ) ))) return E_OUTOFMEMORY;
+            if (!MultiByteToWideChar( CP_UTF8, 0, context->signature, -1, context->signature_utf16, sig_len ))
+            {
+                hr = HRESULT_FROM_WIN32( GetLastError() );
+                FIXME( "token-only signature utf16 conversion failed %#lx\n", hr );
+                return HRESULT_FROM_WIN32( GetLastError() );
+            }
+            context->result_size = sizeof( XUserGetTokenAndSignatureUtf16Data ) + token_len * sizeof( WCHAR ) + sig_len * sizeof( WCHAR );
+        }
+        else
+        {
+            context->result_size = sizeof( XUserGetTokenAndSignatureData ) + strlen( context->token ) + 1 + 1;
+        }
+        return S_OK;
+    }
 
     if (context->utf16)
     {
-        if (FAILED( hr = wide_to_utf8( context->method_utf16, &method ) )) return hr;
+        if (FAILED( hr = wide_to_utf8( context->method_utf16, &method ) ))
+        {
+            FIXME( "method utf16 conversion failed %#lx\n", hr );
+            return hr;
+        }
         url_w = (LPWSTR)context->url_utf16;
     }
     else
     {
-        if (!(method = strdup( context->method ))) return E_OUTOFMEMORY;
+        if (!(method = strdup( context->method )))
+        {
+            FIXME( "method strdup failed\n" );
+            return E_OUTOFMEMORY;
+        }
         if (FAILED( hr = utf8_to_wide( context->url, &url_w ) ))
         {
             free( method );
+            FIXME( "url utf8 conversion failed %#lx, url %s\n", hr, debugstr_a( context->url ) );
             return hr;
         }
     }
@@ -776,7 +863,11 @@ static HRESULT token_context_prepare_result( struct XUserGetTokenAndSignatureCon
     hr = sign_request( user, method, url_w, context->buffer, context->size, &context->signature );
     free( method );
     if (!context->utf16) free( url_w );
-    if (FAILED( hr )) return hr;
+    if (FAILED( hr ))
+    {
+        FIXME( "sign_request failed %#lx\n", hr );
+        return hr;
+    }
 
     if (context->utf16)
     {
@@ -866,7 +957,7 @@ static HRESULT XUserGetTokenAndSignatureProvider( XAsyncOp operation, const XAsy
     IXThreadingImpl *impl;
     HRESULT hr;
 
-    TRACE( "operation %d, providerData %p\n", operation, providerData );
+    FIXME( "operation %d, providerData %p\n", operation, providerData );
 
     if (!providerData) return E_POINTER;
     if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_FAIL;
@@ -882,6 +973,8 @@ static HRESULT XUserGetTokenAndSignatureProvider( XAsyncOp operation, const XAsy
 
         case DoWork:
             hr = token_context_prepare_result( context );
+            if (FAILED( hr )) FIXME( "token_context_prepare_result %#lx\n", hr );
+            else FIXME( "token_context_prepare_result completed result_size %Iu\n", context->result_size );
             impl->lpVtbl->XAsyncComplete( impl, providerData->async, hr, SUCCEEDED( hr ) ? context->result_size : 0 );
             break;
 
@@ -940,6 +1033,7 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureAsync( IXUserImpl *iface, 
     for (SIZE_T i = 0; i < count; i++)
         context->headers[i] = headers[i];
 
+    FIXME( "iface %p, user %p, options %d, method %s, url %s, count %llu, headers %p, size %llu, buffer %p, asyncBlock %p\n", iface, user, options, method, url, count, headers, size, buffer, asyncBlock );
     hr = impl->lpVtbl->XAsyncBegin( impl, asyncBlock, context, x_user_XUserGetTokenAndSignatureAsync, "XUserGetTokenAndSignatureAsync", XUserGetTokenAndSignatureProvider );
     impl->lpVtbl->Release( impl );
     return hr;
@@ -948,11 +1042,14 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureAsync( IXUserImpl *iface, 
 static HRESULT WINAPI x_user_XUserGetTokenAndSignatureResultSize( IXUserImpl *iface, XAsyncBlock *asyncBlock, SIZE_T *size )
 {
     IXThreadingImpl *impl;
+    HRESULT hr;
 
     TRACE( "iface %p, asyncBlock %p, size %p\n", iface, asyncBlock, size );
     if (!asyncBlock || !size) return E_POINTER;
     if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_FAIL;
-    return impl->lpVtbl->XAsyncGetResultSize( impl, asyncBlock, size );
+    hr = impl->lpVtbl->XAsyncGetResultSize( impl, asyncBlock, size );
+    TRACE( "XAsyncGetResultSize returned %#lx, size %Iu\n", hr, *size );
+    return hr;
 }
 
 static HRESULT WINAPI x_user_XUserGetTokenAndSignatureResult( IXUserImpl *iface, XAsyncBlock *asyncBlock, SIZE_T size, PVOID buffer, XUserGetTokenAndSignatureData **ptr, SIZE_T *used )
@@ -963,8 +1060,15 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureResult( IXUserImpl *iface,
     TRACE( "iface %p, asyncBlock %p, size %llu, buffer %p, ptr %p, used %p\n", iface, asyncBlock, size, buffer, ptr, used );
     if (!asyncBlock || !buffer || !ptr) return E_POINTER;
     if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_FAIL;
+    FIXME( "XUserGetTokenAndSignatureResult buffer size %Iu\n", size );
     hr = impl->lpVtbl->XAsyncGetResult( impl, asyncBlock, x_user_XUserGetTokenAndSignatureAsync, size, buffer, used );
-    if (SUCCEEDED( hr )) *ptr = buffer;
+    if (SUCCEEDED( hr )) {
+        *ptr = buffer;
+        //FIXME("TOKEN %s | SIG %s", (*ptr)->token, (*ptr)->signature);
+        FIXME("OK");
+    } else {
+        FIXME("FAILED");
+    }
     return hr;
 }
 
@@ -1026,6 +1130,7 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Result( IXUserImpl *i
     TRACE( "iface %p, asyncBlock %p, size %llu, buffer %p, ptr %p, used %p\n", iface, asyncBlock, size, buffer, ptr, used );
     if (!asyncBlock || !buffer || !ptr) return E_POINTER;
     if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_FAIL;
+    FIXME( "XUserGetTokenAndSignatureUtf16Result buffer size %Iu\n", size );
     hr = impl->lpVtbl->XAsyncGetResult( impl, asyncBlock, x_user_XUserGetTokenAndSignatureUtf16Async, size, buffer, used );
     if (SUCCEEDED( hr )) *ptr = buffer;
     return hr;

@@ -39,6 +39,7 @@ HRESULT RequestXstsTokenWithUserHash( HSTRING user_token, HSTRING *token, HSTRIN
 HRESULT LoadTokenStore( LPCSTR path, HSTRING *client_id, HSTRING *refresh_token );
 HRESULT LoadClientIdFromGameConfig( HSTRING *client_id );
 HRESULT DeviceCodeLoginAndSaveTokenStore( HSTRING client_id, LPCSTR path );
+HRESULT SaveTokenStoreRefreshToken( HSTRING client_id, HSTRING refresh_token );
 HRESULT HSTRINGToMultiByte( HSTRING hstr, LPSTR *str, UINT32 *str_len );
 
 #endif
