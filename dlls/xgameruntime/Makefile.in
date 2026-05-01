@@ -1,4 +1,4 @@
-IMPORTS   = user32 advapi32 crypt32 combase winhttp
+IMPORTS   = user32 advapi32 crypt32 bcrypt combase winhttp
 MODULE    = xgameruntime.dll
 
 SOURCES = \
@@ -21,4 +21,3 @@ SOURCES = \
 	GDKComponent/System/User/Token.c \
 	GDKComponent/System/User/XUser.c \
 	GDKComponent/XGameLaunch.c
-

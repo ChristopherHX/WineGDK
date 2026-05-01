@@ -732,6 +732,78 @@ HRESULT XAsyncGetResultSize( XAsyncBlock* asyncBlock, SIZE_T* bufferSize )
     return result;
 }
 
+HRESULT XAsyncGetResult( XAsyncBlock* asyncBlock, const PVOID identity, SIZE_T bufferSize, PVOID buffer, SIZE_T* bufferUsed )
+{
+    HRESULT result;
+    IAsyncState *state;
+    struct x_async_block_guard *impl;
+    struct async_state *stateImpl = NULL;
+    SIZE_T required;
+
+    TRACE( "asyncBlock %p, identity %p, bufferSize %llu, buffer %p, bufferUsed %p.\n",
+           asyncBlock, identity, bufferSize, buffer, bufferUsed );
+
+    if (!buffer && bufferSize) return E_POINTER;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+
+    impl->IXAsyncBlockInternalGuard_iface.lpVtbl = &x_async_block_guard_vtbl;
+    impl->ref = 1;
+    impl->locked = FALSE;
+
+    InitInternalGuardFromBlock( &impl->IXAsyncBlockInternalGuard_iface, asyncBlock );
+    result = impl->IXAsyncBlockInternalGuard_iface.lpVtbl->GetStatus( &impl->IXAsyncBlockInternalGuard_iface );
+    state = impl->IXAsyncBlockInternalGuard_iface.lpVtbl->GetState( &impl->IXAsyncBlockInternalGuard_iface );
+    stateImpl = state ? impl_from_IAsyncState( state ) : NULL;
+
+    if (!state)
+    {
+        result = E_INVALIDARG;
+        goto done;
+    }
+    if (result == E_PENDING) goto done;
+    if (FAILED( result )) goto done;
+    if (identity && stateImpl->identity != identity)
+    {
+        result = E_INVALIDARG;
+        goto done;
+    }
+    if (impl->IXAsyncBlockInternalGuard_iface.lpVtbl->GetResultsRetrieved( &impl->IXAsyncBlockInternalGuard_iface ))
+    {
+        result = E_INVALIDARG;
+        goto done;
+    }
+
+    required = stateImpl->providerData.bufferSize;
+    if (bufferSize < required)
+    {
+        result = HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
+        goto done;
+    }
+
+    stateImpl->providerData.buffer = buffer;
+    stateImpl->providerData.bufferSize = bufferSize;
+    result = stateImpl->providerCallback( GetResult, &stateImpl->providerData );
+    if (SUCCEEDED( result ))
+    {
+        if (bufferUsed) *bufferUsed = required;
+        stateImpl->providerCallback( Cleanup, &stateImpl->providerData );
+        impl->IXAsyncBlockInternalGuard_iface.lpVtbl->ExtractState( &impl->IXAsyncBlockInternalGuard_iface, TRUE );
+    }
+
+done:
+    if (state) state->lpVtbl->Release( state );
+    if ( impl->locked )
+    {
+        LeaveCriticalSection( &impl->internal->lock );
+        if ( impl->userInternal != impl->internal )
+        {
+            LeaveCriticalSection( &impl->userInternal->lock );
+        }
+    }
+    free( impl );
+    return result;
+}
+
 VOID XAsyncCancel( XAsyncBlock* asyncBlock )
 {
     IAsyncState *state;

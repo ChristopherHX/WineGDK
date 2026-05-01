@@ -119,8 +119,9 @@ static VOID WINAPI x_threading_XAsyncComplete( IXThreadingImpl* iface, XAsyncBlo
 
 static HRESULT WINAPI x_threading_XAsyncGetResult( IXThreadingImpl* iface, XAsyncBlock* asyncBlock, const PVOID identity, SIZE_T bufferSize, PVOID buffer, SIZE_T* bufferUsed )
 {
-    FIXME( "iface %p stub!\n", iface );
-    return E_NOTIMPL;
+    TRACE( "iface %p, asyncBlock %p, identity %p, bufferSize %llu, buffer %p, bufferUsed %p.\n",
+           iface, asyncBlock, identity, bufferSize, buffer, bufferUsed );
+    return XAsyncGetResult( asyncBlock, identity, bufferSize, buffer, bufferUsed );
 }
 
 

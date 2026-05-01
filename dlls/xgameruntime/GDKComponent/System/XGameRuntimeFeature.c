@@ -67,7 +67,7 @@ static BOOLEAN WINAPI x_game_runtime_feature_XGameRuntimeIsFeatureAvailable( IXG
 {
     // Always assume the feature is available, regardless of what game it is, for compatibility reasons.
     TRACE( "iface %p feature %d.\n", iface, feature );
-    return TRUE;
+    return feature != 10;
 }
 
 static const struct IXGameRuntimeFeatureImplVtbl x_game_runtime_feature_vtbl =

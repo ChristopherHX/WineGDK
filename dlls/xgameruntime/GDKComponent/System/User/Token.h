@@ -35,6 +35,10 @@ struct token
 HRESULT RefreshOAuth( LPCSTR client_id, LPCSTR refresh_token, time_t *new_expiry, HSTRING *new_refresh_token, HSTRING *new_oauth_token );
 HRESULT RequestUserToken( HSTRING oauth_token, HSTRING *token, XUserLocalId *localId );
 HRESULT RequestXstsToken( HSTRING user_token, HSTRING *token, UINT64 *xuid, XUserAgeGroup *age_group );
+HRESULT RequestXstsTokenWithUserHash( HSTRING user_token, HSTRING *token, HSTRING *user_hash, HSTRING *gamertag, UINT64 *xuid, XUserAgeGroup *age_group );
+HRESULT LoadTokenStore( LPCSTR path, HSTRING *client_id, HSTRING *refresh_token );
+HRESULT LoadClientIdFromGameConfig( HSTRING *client_id );
+HRESULT DeviceCodeLoginAndSaveTokenStore( HSTRING client_id, LPCSTR path );
 HRESULT HSTRINGToMultiByte( HSTRING hstr, LPSTR *str, UINT32 *str_len );
 
 #endif

@@ -134,6 +134,7 @@ struct x_async_block_guard
 
 HRESULT XAsyncGetStatus( XAsyncBlock* asyncBlock, BOOLEAN wait );
 HRESULT XAsyncGetResultSize( XAsyncBlock* asyncBlock, SIZE_T* bufferSize );
+HRESULT XAsyncGetResult( XAsyncBlock* asyncBlock, const PVOID identity, SIZE_T bufferSize, PVOID buffer, SIZE_T* bufferUsed );
 VOID XAsyncCancel( XAsyncBlock* asyncBlock );
 HRESULT XAsyncRun( XAsyncBlock* asyncBlock, XAsyncWork* work );
 HRESULT XAsyncBegin( XAsyncBlock* asyncBlock, PVOID context, PVOID identity, LPCSTR identityName, XAsyncProviderCallback* provider );

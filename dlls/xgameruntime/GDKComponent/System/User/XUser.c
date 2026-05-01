@@ -23,46 +23,232 @@
 
 #include "XUser.h"
 #include "winhttp.h"
+#include "wincrypt.h"
+#include <ctype.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 
 static const struct IXUserImplVtbl x_user_vtbl;
 static const struct IXUserGamertagVtbl x_user_gt_vtbl;
+static struct x_user x_user;
+static struct x_user *default_user;
+static SRWLOCK default_user_lock = SRWLOCK_INIT;
+
+#define XUSER_SIGNATURE_POLICY_VERSION 1
+#define XUSER_SIGNATURE_MAX_BODY_BYTES 8192
 
 #undef TRACE
 #define TRACE FIXME
 
-static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
+static void x_user_free_members( struct x_user *impl )
 {
-    FIXME( "LoadDefaultUser %d\n", 0 );
-    // abort();
-    struct x_user *impl;
-    LSTATUS status;
-    LPSTR buffer;
+    if (impl->refresh_token) WindowsDeleteString( impl->refresh_token );
+    if (impl->oauth_token) WindowsDeleteString( impl->oauth_token );
+    if (impl->user_token) WindowsDeleteString( impl->user_token );
+    if (impl->xsts_token) WindowsDeleteString( impl->xsts_token );
+    if (impl->user_hash) WindowsDeleteString( impl->user_hash );
+    if (impl->gamertag) WindowsDeleteString( impl->gamertag );
+    if (impl->client_id) WindowsDeleteString( impl->client_id );
+    if (impl->authorization) free( impl->authorization );
+    if (impl->signing_key) BCryptDestroyKey( impl->signing_key );
+}
+
+static HRESULT hstring_to_nul_string( HSTRING hstr, LPSTR *str )
+{
+    UINT32 len;
     HRESULT hr;
-    DWORD size;
+    LPSTR tmp;
 
-    if (!user) return E_POINTER;
+    if (FAILED( hr = HSTRINGToMultiByte( hstr, str, &len ) )) return hr;
+    if (!(tmp = realloc( *str, len + 1 )))
+    {
+        free( *str );
+        *str = NULL;
+        return E_OUTOFMEMORY;
+    }
+    *str = tmp;
+    (*str)[len] = 0;
+    return S_OK;
+}
 
-    FIXME( "LoadDefaultUser %d\n", 1 );
+static HRESULT create_authorization_header( struct x_user *impl )
+{
+    LPSTR user_hash = NULL, token = NULL;
+    UINT32 user_hash_len, token_len;
+    HRESULT hr;
+
+    if (impl->authorization)
+    {
+        free( impl->authorization );
+        impl->authorization = NULL;
+    }
+
+    if (FAILED( hr = HSTRINGToMultiByte( impl->user_hash, &user_hash, &user_hash_len ) )) return hr;
+    if (FAILED( hr = HSTRINGToMultiByte( impl->xsts_token, &token, &token_len ) ))
+    {
+        free( user_hash );
+        return hr;
+    }
+
+    if (!(impl->authorization = calloc( strlen( "XBL3.0 x=;" ) + user_hash_len + token_len + 1, sizeof( CHAR ) )))
+    {
+        free( user_hash );
+        free( token );
+        return E_OUTOFMEMORY;
+    }
+
+    strcpy( impl->authorization, "XBL3.0 x=" );
+    strncat( impl->authorization, user_hash, user_hash_len );
+    strcat( impl->authorization, ";" );
+    strncat( impl->authorization, token, token_len );
+    free( user_hash );
+    free( token );
+    return S_OK;
+}
+
+static HRESULT create_signing_key( BCRYPT_KEY_HANDLE *key )
+{
+    BCRYPT_ALG_HANDLE alg = NULL;
+    NTSTATUS status;
+
+    *key = NULL;
+    if ((status = BCryptOpenAlgorithmProvider( &alg, BCRYPT_ECDSA_P256_ALGORITHM, NULL, 0 )))
+        return HRESULT_FROM_NT( status );
+    if ((status = BCryptGenerateKeyPair( alg, key, 256, 0 )))
+    {
+        BCryptCloseAlgorithmProvider( alg, 0 );
+        return HRESULT_FROM_NT( status );
+    }
+    status = BCryptFinalizeKeyPair( *key, 0 );
+    BCryptCloseAlgorithmProvider( alg, 0 );
+    if (status)
+    {
+        BCryptDestroyKey( *key );
+        *key = NULL;
+        return HRESULT_FROM_NT( status );
+    }
+    return S_OK;
+}
+
+static HRESULT refresh_user_tokens( struct x_user *impl, BOOL force )
+{
+    HSTRING refresh_token = NULL, oauth_token = NULL, user_token = NULL, xsts_token = NULL, user_hash = NULL, gamertag = NULL;
+    LPSTR client_id = NULL, old_refresh = NULL;
+    time_t expiry, now;
+    HRESULT hr;
+
+    now = time( NULL );
+    if (!force && impl->authorization && impl->oauth_token_expiry > now + 300) return S_OK;
+
+    if (FAILED( hr = hstring_to_nul_string( impl->client_id, &client_id ) )) return hr;
+    if (FAILED( hr = hstring_to_nul_string( impl->refresh_token, &old_refresh ) ))
+    {
+        free( client_id );
+        return hr;
+    }
+
+    hr = RefreshOAuth( client_id, old_refresh, &expiry, &refresh_token, &oauth_token );
+    free( client_id );
+    free( old_refresh );
+    if (FAILED( hr )) return E_GAMEUSER_FAILED_TO_GET_TOKEN;
+
+    if (FAILED( hr = RequestUserToken( oauth_token, &user_token, &impl->local_id ) )) goto failed;
+    if (FAILED( hr = RequestXstsTokenWithUserHash( user_token, &xsts_token, &user_hash, &gamertag, &impl->xuid, &impl->age_group ) )) goto failed;
+
+    if (impl->refresh_token) WindowsDeleteString( impl->refresh_token );
+    if (impl->oauth_token) WindowsDeleteString( impl->oauth_token );
+    if (impl->user_token) WindowsDeleteString( impl->user_token );
+    if (impl->xsts_token) WindowsDeleteString( impl->xsts_token );
+    if (impl->user_hash) WindowsDeleteString( impl->user_hash );
+    impl->refresh_token = refresh_token;
+    impl->oauth_token = oauth_token;
+    impl->user_token = user_token;
+    impl->xsts_token = xsts_token;
+    impl->user_hash = user_hash;
+    if (gamertag)
+    {
+        if (impl->gamertag) WindowsDeleteString( impl->gamertag );
+        impl->gamertag = gamertag;
+    }
+    impl->oauth_token_expiry = expiry;
+
+    return create_authorization_header( impl );
+
+failed:
+    if (refresh_token) WindowsDeleteString( refresh_token );
+    if (oauth_token) WindowsDeleteString( oauth_token );
+    if (user_token) WindowsDeleteString( user_token );
+    if (xsts_token) WindowsDeleteString( xsts_token );
+    if (user_hash) WindowsDeleteString( user_hash );
+    if (gamertag) WindowsDeleteString( gamertag );
+    return E_GAMEUSER_FAILED_TO_GET_TOKEN;
+}
+
+static HRESULT create_default_user( struct x_user **out, XUserAddOptions options )
+{
+    HSTRING client_id = NULL, refresh_token = NULL;
+    struct x_user *impl;
+    HRESULT hr;
+
+    *out = NULL;
+
+    hr = LoadTokenStore( "tokens.json", &client_id, &refresh_token );
+    if (FAILED( hr )/* && (options & XUserAddOptions_AddDefaultUserAllowingUI) */)
+    {
+        if (SUCCEEDED( hr = LoadClientIdFromGameConfig( &client_id ) ))
+        {
+            hr = DeviceCodeLoginAndSaveTokenStore( client_id, "tokens.json" );
+            WindowsDeleteString( client_id );
+            client_id = NULL;
+            if (SUCCEEDED( hr )) hr = LoadTokenStore( "tokens.json", &client_id, &refresh_token );
+        }
+    }
+    if (FAILED( hr )) return hr;
 
     if (!(impl = calloc( 1, sizeof( *impl ) )))
     {
-        free( buffer );
+        WindowsDeleteString( client_id );
+        WindowsDeleteString( refresh_token );
         return E_OUTOFMEMORY;
     }
 
     impl->IXUserImpl_iface.lpVtbl = &x_user_vtbl;
     impl->IXUserGamertag_iface.lpVtbl = &x_user_gt_vtbl;
     impl->ref = 1;
-    // TODO: xuid
-    impl->xuid = 0x0;
+    impl->heap_allocated = TRUE;
+    impl->cached_default = TRUE;
+    impl->client_id = client_id;
+    impl->refresh_token = refresh_token;
 
-    *user = (XUserHandle)impl;
+    if (FAILED( hr = create_signing_key( &impl->signing_key ) ) ||
+        FAILED( hr = refresh_user_tokens( impl, TRUE ) ))
+    {
+        x_user_free_members( impl );
+        free( impl );
+        return hr;
+    }
 
-    FIXME( "LoadDefaultUser C\n" );
+    *out = impl;
+    return S_OK;
+}
 
-    return 0;
+static HRESULT LoadDefaultUser( XUserHandle *user, XUserAddOptions options )
+{
+    HRESULT hr = S_OK;
+
+    if (!user) return E_POINTER;
+    *user = NULL;
+
+    AcquireSRWLockExclusive( &default_user_lock );
+    if (!default_user)
+        hr = create_default_user( &default_user, options );
+    if (SUCCEEDED( hr ))
+    {
+        IXUserImpl_AddRef( &default_user->IXUserImpl_iface );
+        *user = (XUserHandle)default_user;
+    }
+    ReleaseSRWLockExclusive( &default_user_lock );
+    return hr;
 }
 
 static inline struct x_user *impl_from_IXUserImpl( IXUserImpl *iface )
@@ -118,11 +304,8 @@ static ULONG WINAPI x_user_Release( IXUserImpl *iface )
     TRACE( "iface %p decreasing refcount to %lu\n", iface, ref );
     if (!ref)
     {
-        WindowsDeleteString( impl->refresh_token );
-        WindowsDeleteString( impl->oauth_token );
-        WindowsDeleteString( impl->user_token );
-        WindowsDeleteString( impl->xsts_token );
-        free( impl );
+        x_user_free_members( impl );
+        if (impl->heap_allocated) free( impl );
     }
     return ref;
 }
@@ -162,7 +345,6 @@ struct XUserAddContext
 {
     XUserAddOptions options;
     XUserHandle user;
-    LPCSTR client_id;
 };
 
 static HRESULT XUserAddProvider( XAsyncOp operation, const XAsyncProviderData *providerData )
@@ -184,14 +366,12 @@ static HRESULT XUserAddProvider( XAsyncOp operation, const XAsyncProviderData *p
             return impl->lpVtbl->XAsyncSchedule( impl, providerData->async, 0 );
 
         case GetResult:
-            if(context->user == NULL) {
-                abort();
-            }
+            if (!context->user) return E_GAMEUSER_NO_DEFAULT_USER;
             memcpy( providerData->buffer, &context->user, sizeof( XUserHandle ) );
             break;
 
         case DoWork:
-            hr = LoadDefaultUser( &context->user, context->client_id );
+            hr = LoadDefaultUser( &context->user, context->options );
 
             impl->lpVtbl->XAsyncComplete( impl, providerData->async, hr, sizeof( XUserHandle ) );
             break;
@@ -244,9 +424,7 @@ static HRESULT WINAPI x_user_XUserGetLocalId( IXUserImpl *iface, XUserHandle use
 {
     TRACE( "iface %p, user %p, localId %p\n", iface, user, localId );
     if (!user || !localId) return E_POINTER;
-    XUserLocalId id;
-    id.value = 1;
-    *localId = id;
+    *localId = ((struct x_user*)user)->local_id;
     return S_OK;
 }
 
@@ -282,9 +460,10 @@ static HRESULT WINAPI x_user_XUserGetIsGuest( IXUserImpl *iface, XUserHandle use
 
 static HRESULT WINAPI x_user_XUserGetState( IXUserImpl *iface, XUserHandle user, XUserState *state )
 {
-    FIXME( "iface %p, user %p, state %p stub!\n", iface, user, state );
-    abort();
-    return E_NOTIMPL;
+    TRACE( "iface %p, user %p, state %p\n", iface, user, state );
+    if (!user || !state) return E_POINTER;
+    *state = XUserState_SignedIn;
+    return S_OK;
 }
 
 static HRESULT WINAPI __PADDING__( IXUserImpl *iface )
@@ -320,15 +499,20 @@ static HRESULT WINAPI x_user_XUserGetAgeGroup( IXUserImpl *iface, XUserHandle us
     TRACE( "iface %p, user %p, group %p\n", iface, user, group );
 
     if (!user || !group) return E_POINTER;
-    *group = XUserAgeGroup_Adult;
+    *group = ((struct x_user*)user)->age_group;
     return S_OK;
 }
 
 static HRESULT WINAPI x_user_XUserCheckPrivilege( IXUserImpl *iface, XUserHandle user, XUserPrivilegeOptions options, XUserPrivilege privilege, BOOLEAN *hasPrivilege, XUserPrivilegeDenyReason *reason )
 {
-    FIXME( "iface %p, user %p, options %d, privilege %d, hasPrivilege %p, reason %p stub!\n", iface, user, options, privilege, hasPrivilege, reason );
-    //abort();
-    return E_NOTIMPL;
+    TRACE( "iface %p, user %p, options %d, privilege %d, hasPrivilege %p, reason %p\n",
+           iface, user, options, privilege, hasPrivilege, reason );
+
+    if (!user || !hasPrivilege) return E_POINTER;
+
+    *hasPrivilege = TRUE;
+    if (reason) *reason = XUserPrivilegeDenyReason_None;
+    return S_OK;
 }
 
 static HRESULT WINAPI x_user_XUserResolvePrivilegeWithUiAsync( IXUserImpl *iface, XUserHandle user, XUserPrivilegeOptions options, XUserPrivilege privilege, XAsyncBlock *asyncBlock )
@@ -359,12 +543,328 @@ struct XUserGetTokenAndSignatureContext
     XUserGetTokenAndSignatureUtf16HttpHeader *headers_utf16;
     SIZE_T size;
     const void *buffer;
+    LPSTR token;
+    LPSTR signature;
+    LPWSTR token_utf16;
+    LPWSTR signature_utf16;
+    SIZE_T result_size;
 };
+
+static HRESULT sha256_hash( const BYTE *data, DWORD data_size, BYTE hash[32] )
+{
+    BCRYPT_ALG_HANDLE alg = NULL;
+    BCRYPT_HASH_HANDLE hash_handle = NULL;
+    DWORD object_size, result_size;
+    BYTE *object = NULL;
+    NTSTATUS status;
+
+    if ((status = BCryptOpenAlgorithmProvider( &alg, BCRYPT_SHA256_ALGORITHM, NULL, 0 ))) goto done;
+    if ((status = BCryptGetProperty( alg, BCRYPT_OBJECT_LENGTH, (BYTE *)&object_size, sizeof( object_size ), &result_size, 0 ))) goto done;
+    if (!(object = calloc( 1, object_size )))
+    {
+        status = STATUS_NO_MEMORY;
+        goto done;
+    }
+    if ((status = BCryptCreateHash( alg, &hash_handle, object, object_size, NULL, 0, 0 ))) goto done;
+    if ((status = BCryptHashData( hash_handle, (BYTE *)data, data_size, 0 ))) goto done;
+    status = BCryptFinishHash( hash_handle, hash, 32, 0 );
+
+done:
+    if (hash_handle) BCryptDestroyHash( hash_handle );
+    if (alg) BCryptCloseAlgorithmProvider( alg, 0 );
+    free( object );
+    return status ? HRESULT_FROM_NT( status ) : S_OK;
+}
+
+static void append_bytes( BYTE **ptr, const void *data, SIZE_T size )
+{
+    memcpy( *ptr, data, size );
+    *ptr += size;
+}
+
+static HRESULT get_path_and_query( LPCWSTR url, LPSTR *path_and_query )
+{
+    URL_COMPONENTSW components;
+    DWORD len;
+    HRESULT hr = S_OK;
+    LPWSTR wide;
+
+    *path_and_query = NULL;
+    memset( &components, 0, sizeof( components ) );
+    components.dwStructSize = sizeof( components );
+    components.dwUrlPathLength = -1;
+    components.dwExtraInfoLength = -1;
+
+    if (!WinHttpCrackUrl( url, 0, 0, &components )) return HRESULT_FROM_WIN32( GetLastError() );
+    len = components.dwUrlPathLength + components.dwExtraInfoLength;
+    if (!len) return E_FAIL;
+    if (!(wide = calloc( len + 1, sizeof( WCHAR ) ))) return E_OUTOFMEMORY;
+    if (components.dwUrlPathLength) memcpy( wide, components.lpszUrlPath, components.dwUrlPathLength * sizeof( WCHAR ) );
+    if (components.dwExtraInfoLength) memcpy( wide + components.dwUrlPathLength, components.lpszExtraInfo, components.dwExtraInfoLength * sizeof( WCHAR ) );
+
+    len = WideCharToMultiByte( CP_UTF8, 0, wide, len, NULL, 0, NULL, NULL );
+    if (!len) hr = HRESULT_FROM_WIN32( GetLastError() );
+    else if (!(*path_and_query = calloc( len + 1, sizeof( CHAR ) ))) hr = E_OUTOFMEMORY;
+    else if (!WideCharToMultiByte( CP_UTF8, 0, wide, -1, *path_and_query, len + 1, NULL, NULL ))
+    {
+        free( *path_and_query );
+        *path_and_query = NULL;
+        hr = HRESULT_FROM_WIN32( GetLastError() );
+    }
+
+    free( wide );
+    return hr;
+}
+
+static HRESULT sign_request( struct x_user *user, LPCSTR method, LPCWSTR url, const void *body, SIZE_T body_size, LPSTR *signature )
+{
+    BYTE version[4] = {0, 0, 0, XUSER_SIGNATURE_POLICY_VERSION};
+    BYTE timestamp[8], hash[32], *message = NULL, *ptr, *sig = NULL, *blob = NULL;
+    DWORD sig_size = 0, blob_size, base64_size;
+    ULARGE_INTEGER filetime_int;
+    FILETIME filetime;
+    LPSTR path_and_query = NULL, method_upper = NULL;
+    SIZE_T method_len, path_len, auth_len, body_hash_size, message_size;
+    HRESULT hr;
+    NTSTATUS status;
+
+    *signature = NULL;
+    if (!user->signing_key) return E_FAIL;
+    if (FAILED( hr = get_path_and_query( url, &path_and_query ) )) return hr;
+
+    method_len = strlen( method );
+    if (!(method_upper = calloc( method_len + 1, sizeof( CHAR ) )))
+    {
+        free( path_and_query );
+        return E_OUTOFMEMORY;
+    }
+    for (SIZE_T i = 0; i < method_len; i++) method_upper[i] = toupper( method[i] );
+
+    GetSystemTimeAsFileTime( &filetime );
+    filetime_int.LowPart = filetime.dwLowDateTime;
+    filetime_int.HighPart = filetime.dwHighDateTime;
+    for (int i = 0; i < 8; i++) timestamp[i] = (BYTE)(filetime_int.QuadPart >> ((7 - i) * 8));
+
+    path_len = strlen( path_and_query );
+    auth_len = user->authorization ? strlen( user->authorization ) : 0;
+    body_hash_size = body_size < XUSER_SIGNATURE_MAX_BODY_BYTES ? body_size : XUSER_SIGNATURE_MAX_BODY_BYTES;
+    message_size = sizeof( version ) + 1 + sizeof( timestamp ) + 1 + method_len + 1 + path_len + 1 + auth_len + 1 + body_hash_size + 1;
+    if (!(message = calloc( 1, message_size )))
+    {
+        hr = E_OUTOFMEMORY;
+        goto done;
+    }
+    ptr = message;
+    append_bytes( &ptr, version, sizeof( version ) ); ptr++;
+    append_bytes( &ptr, timestamp, sizeof( timestamp ) ); ptr++;
+    append_bytes( &ptr, method_upper, method_len ); ptr++;
+    append_bytes( &ptr, path_and_query, path_len ); ptr++;
+    if (auth_len) append_bytes( &ptr, user->authorization, auth_len );
+    ptr++;
+    if (body_hash_size) append_bytes( &ptr, body, body_hash_size );
+
+    if (FAILED( hr = sha256_hash( message, message_size, hash ) )) goto done;
+    if ((status = BCryptSignHash( user->signing_key, NULL, hash, sizeof( hash ), NULL, 0, &sig_size, 0 )))
+    {
+        hr = HRESULT_FROM_NT( status );
+        goto done;
+    }
+    if (!(sig = calloc( 1, sig_size )) || !(blob = calloc( 1, sizeof( version ) + sizeof( timestamp ) + sig_size )))
+    {
+        hr = E_OUTOFMEMORY;
+        goto done;
+    }
+    if ((status = BCryptSignHash( user->signing_key, NULL, hash, sizeof( hash ), sig, sig_size, &sig_size, 0 )))
+    {
+        hr = HRESULT_FROM_NT( status );
+        goto done;
+    }
+    memcpy( blob, version, sizeof( version ) );
+    memcpy( blob + sizeof( version ), timestamp, sizeof( timestamp ) );
+    memcpy( blob + sizeof( version ) + sizeof( timestamp ), sig, sig_size );
+    blob_size = sizeof( version ) + sizeof( timestamp ) + sig_size;
+
+    if (!CryptBinaryToStringA( blob, blob_size, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, NULL, &base64_size ))
+    {
+        hr = HRESULT_FROM_WIN32( GetLastError() );
+        goto done;
+    }
+    if (!(*signature = calloc( base64_size, sizeof( CHAR ) )))
+    {
+        hr = E_OUTOFMEMORY;
+        goto done;
+    }
+    if (!CryptBinaryToStringA( blob, blob_size, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, *signature, &base64_size ))
+    {
+        free( *signature );
+        *signature = NULL;
+        hr = HRESULT_FROM_WIN32( GetLastError() );
+        goto done;
+    }
+    hr = S_OK;
+
+done:
+    free( path_and_query );
+    free( method_upper );
+    free( message );
+    free( sig );
+    free( blob );
+    return hr;
+}
+
+static HRESULT utf8_to_wide( LPCSTR str, LPWSTR *wide )
+{
+    int len;
+
+    *wide = NULL;
+    if (!(len = MultiByteToWideChar( CP_UTF8, 0, str, -1, NULL, 0 )))
+        return HRESULT_FROM_WIN32( GetLastError() );
+    if (!(*wide = calloc( len, sizeof( WCHAR ) ))) return E_OUTOFMEMORY;
+    if (!MultiByteToWideChar( CP_UTF8, 0, str, -1, *wide, len ))
+    {
+        free( *wide );
+        *wide = NULL;
+        return HRESULT_FROM_WIN32( GetLastError() );
+    }
+    return S_OK;
+}
+
+static HRESULT wide_to_utf8( LPCWSTR wide, LPSTR *str )
+{
+    int len;
+
+    *str = NULL;
+    if (!(len = WideCharToMultiByte( CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL )))
+        return HRESULT_FROM_WIN32( GetLastError() );
+    if (!(*str = calloc( len, sizeof( CHAR ) ))) return E_OUTOFMEMORY;
+    if (!WideCharToMultiByte( CP_UTF8, 0, wide, -1, *str, len, NULL, NULL ))
+    {
+        free( *str );
+        *str = NULL;
+        return HRESULT_FROM_WIN32( GetLastError() );
+    }
+    return S_OK;
+}
+
+static HRESULT token_context_prepare_result( struct XUserGetTokenAndSignatureContext *context )
+{
+    struct x_user *user = context->user;
+    LPWSTR url_w = NULL;
+    LPSTR method = NULL;
+    HRESULT hr;
+
+    if (FAILED( hr = refresh_user_tokens( user, context->options & XUserGetTokenAndSignatureOptions_ForceRefresh ) ))
+        return hr;
+
+    if (!(context->token = strdup( user->authorization ? user->authorization : "" ))) return E_OUTOFMEMORY;
+
+    if (context->utf16)
+    {
+        if (FAILED( hr = wide_to_utf8( context->method_utf16, &method ) )) return hr;
+        url_w = (LPWSTR)context->url_utf16;
+    }
+    else
+    {
+        if (!(method = strdup( context->method ))) return E_OUTOFMEMORY;
+        if (FAILED( hr = utf8_to_wide( context->url, &url_w ) ))
+        {
+            free( method );
+            return hr;
+        }
+    }
+
+    hr = sign_request( user, method, url_w, context->buffer, context->size, &context->signature );
+    free( method );
+    if (!context->utf16) free( url_w );
+    if (FAILED( hr )) return hr;
+
+    if (context->utf16)
+    {
+        int token_len = MultiByteToWideChar( CP_UTF8, 0, context->token, -1, NULL, 0 );
+        int sig_len = context->signature ? MultiByteToWideChar( CP_UTF8, 0, context->signature, -1, NULL, 0 ) : 0;
+        if (!token_len || (context->signature && !sig_len)) return HRESULT_FROM_WIN32( GetLastError() );
+        if (!(context->token_utf16 = calloc( token_len, sizeof( WCHAR ) ))) return E_OUTOFMEMORY;
+        if (!MultiByteToWideChar( CP_UTF8, 0, context->token, -1, context->token_utf16, token_len ))
+            return HRESULT_FROM_WIN32( GetLastError() );
+        if (context->signature)
+        {
+            if (!(context->signature_utf16 = calloc( sig_len, sizeof( WCHAR ) ))) return E_OUTOFMEMORY;
+            if (!MultiByteToWideChar( CP_UTF8, 0, context->signature, -1, context->signature_utf16, sig_len ))
+                return HRESULT_FROM_WIN32( GetLastError() );
+        }
+        context->result_size = sizeof( XUserGetTokenAndSignatureUtf16Data ) +
+            token_len * sizeof( WCHAR ) + (context->signature ? sig_len * sizeof( WCHAR ) : 0);
+    }
+    else
+    {
+        context->result_size = sizeof( XUserGetTokenAndSignatureData ) +
+            strlen( context->token ) + 1 + (context->signature ? strlen( context->signature ) + 1 : 0);
+    }
+    return S_OK;
+}
+
+static HRESULT token_context_get_result( struct XUserGetTokenAndSignatureContext *context, SIZE_T size, void *buffer, SIZE_T *used )
+{
+    BYTE *cursor = buffer;
+
+    if (!buffer) return E_POINTER;
+    if (size < context->result_size) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
+
+    if (context->utf16)
+    {
+        XUserGetTokenAndSignatureUtf16Data *data = buffer;
+        SIZE_T token_bytes = (wcslen( context->token_utf16 ) + 1) * sizeof( WCHAR );
+        SIZE_T signature_bytes = context->signature_utf16 ? (wcslen( context->signature_utf16 ) + 1) * sizeof( WCHAR ) : 0;
+
+        cursor += sizeof( *data );
+        data->token = (LPCWSTR)cursor;
+        data->tokenCount = wcslen( context->token_utf16 ) + 1;
+        memcpy( cursor, context->token_utf16, token_bytes );
+        cursor += token_bytes;
+        if (context->signature_utf16)
+        {
+            data->signature = (LPCWSTR)cursor;
+            data->signatureCount = wcslen( context->signature_utf16 ) + 1;
+            memcpy( cursor, context->signature_utf16, signature_bytes );
+        }
+        else
+        {
+            data->signature = NULL;
+            data->signatureCount = 0;
+        }
+    }
+    else
+    {
+        XUserGetTokenAndSignatureData *data = buffer;
+        SIZE_T token_bytes = strlen( context->token ) + 1;
+        SIZE_T signature_bytes = context->signature ? strlen( context->signature ) + 1 : 0;
+
+        cursor += sizeof( *data );
+        data->token = (LPCSTR)cursor;
+        data->tokenSize = token_bytes;
+        memcpy( cursor, context->token, token_bytes );
+        cursor += token_bytes;
+        if (context->signature)
+        {
+            data->signature = (LPCSTR)cursor;
+            data->signatureSize = signature_bytes;
+            memcpy( cursor, context->signature, signature_bytes );
+        }
+        else
+        {
+            data->signature = NULL;
+            data->signatureSize = 0;
+        }
+    }
+    if (used) *used = context->result_size;
+    return S_OK;
+}
 
 static HRESULT XUserGetTokenAndSignatureProvider( XAsyncOp operation, const XAsyncProviderData *providerData )
 {
     struct XUserGetTokenAndSignatureContext *context;
     IXThreadingImpl *impl;
+    HRESULT hr;
 
     TRACE( "operation %d, providerData %p\n", operation, providerData );
 
@@ -378,10 +878,11 @@ static HRESULT XUserGetTokenAndSignatureProvider( XAsyncOp operation, const XAsy
             return impl->lpVtbl->XAsyncSchedule( impl, providerData->async, 0 );
 
         case GetResult:
-            break;
+            return token_context_get_result( context, providerData->bufferSize, providerData->buffer, NULL );
 
         case DoWork:
-            impl->lpVtbl->XAsyncComplete( impl, providerData->async, S_OK, sizeof( XUserHandle ) );
+            hr = token_context_prepare_result( context );
+            impl->lpVtbl->XAsyncComplete( impl, providerData->async, hr, SUCCEEDED( hr ) ? context->result_size : 0 );
             break;
 
         case Cleanup:
@@ -390,6 +891,10 @@ static HRESULT XUserGetTokenAndSignatureProvider( XAsyncOp operation, const XAsy
                 if (context->utf16) free( context->headers_utf16 );
                 else free( context->headers );
             }
+            free( context->token );
+            free( context->signature );
+            free( context->token_utf16 );
+            free( context->signature_utf16 );
             free( context );
             break;
 
@@ -407,11 +912,9 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureAsync( IXUserImpl *iface, 
     HRESULT hr;
 
     FIXME( "iface %p, user %p, options %d, method %s, url %s, count %llu, headers %p, size %llu, buffer %p, asyncBlock %p\n", iface, user, options, method, url, count, headers, size, buffer, asyncBlock );
-    for(int i = 0; i < count; i++) {
-        FIXME("%s: %s", headers[i].name, headers[i].value);
-    }
 
-    if (!user || !method || !url || !headers || !buffer || !asyncBlock) return E_POINTER;
+    if (!user || !method || !url || (count && !headers) || (size && !buffer) || !asyncBlock) return E_POINTER;
+    for (SIZE_T i = 0; i < count; i++) FIXME( "%s: %s", headers[i].name, headers[i].value );
     if (FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return hr;
     if (!(context = calloc( 1, sizeof( *context ) )))
     {
@@ -442,42 +945,39 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureAsync( IXUserImpl *iface, 
     return hr;
 }
 
-static char tkn[] = "XBL3.0 x=;";
-
 static HRESULT WINAPI x_user_XUserGetTokenAndSignatureResultSize( IXUserImpl *iface, XAsyncBlock *asyncBlock, SIZE_T *size )
 {
-    *size = sizeof(XUserGetTokenAndSignatureData) + sizeof(tkn);
-    FIXME( "iface %p, asyncBlock %p, size %p stub!\n", iface, asyncBlock, size );
-    return 0;
+    IXThreadingImpl *impl;
+
+    TRACE( "iface %p, asyncBlock %p, size %p\n", iface, asyncBlock, size );
+    if (!asyncBlock || !size) return E_POINTER;
+    if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_FAIL;
+    return impl->lpVtbl->XAsyncGetResultSize( impl, asyncBlock, size );
 }
 
 static HRESULT WINAPI x_user_XUserGetTokenAndSignatureResult( IXUserImpl *iface, XAsyncBlock *asyncBlock, SIZE_T size, PVOID buffer, XUserGetTokenAndSignatureData **ptr, SIZE_T *used )
 {
-    
-    FIXME( "iface %p, asyncBlock %p, size %llu, buffer %p, ptr %p, used %p stub!\n", iface, asyncBlock, size, buffer, ptr, used );
+    IXThreadingImpl *impl;
+    HRESULT hr;
 
-    *ptr = (XUserGetTokenAndSignatureData*)buffer;
-    (*ptr)->token = tkn;
-    ((char*)buffer)[size-1] = '\0';
-    (*ptr)->tokenSize = strlen(tkn);
-    (*ptr)->signatureSize = 0;
-    (*ptr)->signature = NULL;
-    if(used) {
-        *used = size;
-    }
-    return 0;
+    TRACE( "iface %p, asyncBlock %p, size %llu, buffer %p, ptr %p, used %p\n", iface, asyncBlock, size, buffer, ptr, used );
+    if (!asyncBlock || !buffer || !ptr) return E_POINTER;
+    if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_FAIL;
+    hr = impl->lpVtbl->XAsyncGetResult( impl, asyncBlock, x_user_XUserGetTokenAndSignatureAsync, size, buffer, used );
+    if (SUCCEEDED( hr )) *ptr = buffer;
+    return hr;
 }
 
 static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Async( IXUserImpl *iface, XUserHandle user, XUserGetTokenAndSignatureOptions options, LPCWSTR method, LPCWSTR url, SIZE_T count, const XUserGetTokenAndSignatureUtf16HttpHeader *headers, SIZE_T size, const void *buffer, XAsyncBlock *asyncBlock )
 {
-    abort();
     struct XUserGetTokenAndSignatureContext *context;
     IXThreadingImpl *impl;
     HRESULT hr;
 
-    TRACE( "iface %p, user %p, options %d, method %hs, url %hs, count %llu, headers %p, size %llu, buffer %p, asyncBlock %p\n", iface, user, options, method, url, count, headers, size, buffer, asyncBlock );
+    TRACE( "iface %p, user %p, options %d, method %s, url %s, count %llu, headers %p, size %llu, buffer %p, asyncBlock %p\n",
+           iface, user, options, debugstr_w( method ), debugstr_w( url ), count, headers, size, buffer, asyncBlock );
 
-    if (!user || !method || !url || !headers || !buffer || !asyncBlock) return E_POINTER;
+    if (!user || !method || !url || (count && !headers) || (size && !buffer) || !asyncBlock) return E_POINTER;
     if (FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return hr;
     if (!(context = calloc( 1, sizeof( *context ) )))
     {
@@ -510,16 +1010,25 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Async( IXUserImpl *if
 
 static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16ResultSize( IXUserImpl *iface, XAsyncBlock *asyncBlock, SIZE_T *size )
 {
-    abort();
-    FIXME( "iface %p, asyncBlock %p, size %p stub!\n", iface, asyncBlock, size );
-    return E_NOTIMPL;
+    IXThreadingImpl *impl;
+
+    TRACE( "iface %p, asyncBlock %p, size %p\n", iface, asyncBlock, size );
+    if (!asyncBlock || !size) return E_POINTER;
+    if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_FAIL;
+    return impl->lpVtbl->XAsyncGetResultSize( impl, asyncBlock, size );
 }
 
 static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Result( IXUserImpl *iface, XAsyncBlock *asyncBlock, SIZE_T size, PVOID buffer, XUserGetTokenAndSignatureUtf16Data **ptr, SIZE_T *used )
 {
-    abort();
-    FIXME( "iface %p, asyncBlock %p, size %llu, buffer %p, ptr %p, used %p stub!\n", iface, asyncBlock, size, buffer, ptr, used );
-    return E_NOTIMPL;
+    IXThreadingImpl *impl;
+    HRESULT hr;
+
+    TRACE( "iface %p, asyncBlock %p, size %llu, buffer %p, ptr %p, used %p\n", iface, asyncBlock, size, buffer, ptr, used );
+    if (!asyncBlock || !buffer || !ptr) return E_POINTER;
+    if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_FAIL;
+    hr = impl->lpVtbl->XAsyncGetResult( impl, asyncBlock, x_user_XUserGetTokenAndSignatureUtf16Async, size, buffer, used );
+    if (SUCCEEDED( hr )) *ptr = buffer;
+    return hr;
 }
 
 static HRESULT WINAPI x_user_XUserResolveIssueWithUiAsync( IXUserImpl *iface, XUserHandle user, LPCSTR url, XAsyncBlock *asyncBlock )
@@ -539,7 +1048,7 @@ static HRESULT WINAPI x_user_XUserResolveIssueWithUiResult( IXUserImpl *iface, X
 static HRESULT WINAPI x_user_XUserResolveIssueWithUiUtf16Async( IXUserImpl *iface, XUserHandle user, LPCWSTR url, XAsyncBlock *asyncBlock )
 {
     abort();
-    FIXME( "iface %p, user %p, url %hs, asyncBlock %p stub!\n", iface, user, url, asyncBlock );
+    FIXME( "iface %p, user %p, url %s, asyncBlock %p stub!\n", iface, user, debugstr_w( url ), asyncBlock );
     return E_NOTIMPL;
 }
 
@@ -784,23 +1293,39 @@ static ULONG WINAPI x_user_gt_Release( IXUserGamertag *iface )
     TRACE( "iface %p decreasing refcount to %lu\n", iface, ref );
     if (!ref)
     {
-        WindowsDeleteString( impl->refresh_token );
-        WindowsDeleteString( impl->oauth_token );
-        WindowsDeleteString( impl->user_token );
-        WindowsDeleteString( impl->xsts_token );
-        free( impl );
+        x_user_free_members( impl );
+        if (impl->heap_allocated) free( impl );
     }
     return ref;
 }
 
 static HRESULT x_user_gt_XUserGetGamertag( IXUserGamertag *iface, XUserHandle user, XUserGamertagComponent component, SIZE_T size, LPSTR gamertag, SIZE_T *used )
 {
+    struct x_user *impl = user;
+    LPSTR tag = NULL;
+    UINT32 tag_len;
+    HRESULT hr;
+
     FIXME( "iface %p, user %p, component %d, size %llu, gamertag %p, used %p stub!\n", iface, user, component, size, gamertag, used );
-    char def[] = "ChristopherHX";
-    int len = sizeof(def) < size ? sizeof(def) : size;
-    memcpy(gamertag, def, len - 1);
-    gamertag[len - 1] = '\0';
-    return 0;
+
+    if (!user || !gamertag || !used) return E_POINTER;
+    if (impl->gamertag && SUCCEEDED( hr = HSTRINGToMultiByte( impl->gamertag, &tag, &tag_len ) ))
+    {
+        if (size < tag_len + 1)
+        {
+            free( tag );
+            return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
+        }
+        memcpy( gamertag, tag, tag_len );
+        gamertag[tag_len] = 0;
+        *used = tag_len + 1;
+        free( tag );
+        return S_OK;
+    }
+    if (size < 1) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
+    gamertag[0] = 0;
+    *used = 1;
+    return S_OK;
 }
 
 static const struct IXUserGamertagVtbl x_user_gt_vtbl =

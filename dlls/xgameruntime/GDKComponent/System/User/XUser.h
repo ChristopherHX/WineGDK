@@ -26,6 +26,7 @@
 
 #include "../../../private.h"
 #include "Token.h"
+#include <bcrypt.h>
 
 struct x_user
 {
@@ -42,6 +43,13 @@ struct x_user
     HSTRING oauth_token;
     HSTRING user_token;
     HSTRING xsts_token;
+    HSTRING user_hash;
+    HSTRING gamertag;
+    HSTRING client_id;
+    LPSTR authorization;
+    BCRYPT_KEY_HANDLE signing_key;
+    BOOL heap_allocated;
+    BOOL cached_default;
 };
 
 #endif
