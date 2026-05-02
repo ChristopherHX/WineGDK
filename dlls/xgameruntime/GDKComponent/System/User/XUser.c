@@ -33,6 +33,7 @@ static const struct IXUserGamertagVtbl x_user_gt_vtbl;
 static struct x_user x_user;
 static struct x_user *default_user;
 static SRWLOCK default_user_lock = SRWLOCK_INIT;
+static void clear_xsts_cache( struct x_user *user );
 
 #define XUSER_SIGNATURE_POLICY_VERSION 1
 #define XUSER_SIGNATURE_MAX_BODY_BYTES 8192
@@ -56,6 +57,7 @@ void WINAPI __debug_check(HRESULT hr) {
 
 static void x_user_free_members( struct x_user *impl )
 {
+    clear_xsts_cache( impl );
     if (impl->refresh_token) WindowsDeleteString( impl->refresh_token );
     if (impl->oauth_token) WindowsDeleteString( impl->oauth_token );
     if (impl->user_token) WindowsDeleteString( impl->user_token );
@@ -64,6 +66,7 @@ static void x_user_free_members( struct x_user *impl )
     if (impl->gamertag) WindowsDeleteString( impl->gamertag );
     if (impl->client_id) WindowsDeleteString( impl->client_id );
     if (impl->authorization) free( impl->authorization );
+    if (impl->proof_key_json) free( impl->proof_key_json );
     if (impl->signing_key) BCryptDestroyKey( impl->signing_key );
 }
 
@@ -236,6 +239,129 @@ done:
     XUSER_RETURN_HR( hr );
 }
 
+static void free_xsts_cache_entry( struct xsts_cache_entry *entry )
+{
+    free( entry->relying_party );
+    free( entry->authorization_single );
+    free( entry->authorization_all );
+    free( entry );
+}
+
+static void clear_xsts_cache( struct x_user *user )
+{
+    struct xsts_cache_entry *entry, *next;
+
+    AcquireSRWLockExclusive( &user->token_cache_lock );
+    entry = user->token_cache;
+    user->token_cache = NULL;
+    ReleaseSRWLockExclusive( &user->token_cache_lock );
+
+    while (entry)
+    {
+        next = entry->next;
+        free_xsts_cache_entry( entry );
+        entry = next;
+    }
+}
+
+static HRESULT get_cached_proof_key_json( struct x_user *user, LPSTR *proof_key_json )
+{
+    HRESULT hr;
+    LPSTR generated = NULL;
+
+    *proof_key_json = NULL;
+    AcquireSRWLockShared( &user->token_cache_lock );
+    if (user->proof_key_json)
+    {
+        if (!(*proof_key_json = strdup( user->proof_key_json )))
+        {
+            ReleaseSRWLockShared( &user->token_cache_lock );
+            XUSER_RETURN_HR_WHERE( "strdup", E_OUTOFMEMORY );
+        }
+        ReleaseSRWLockShared( &user->token_cache_lock );
+        XUSER_RETURN_HR( S_OK );
+    }
+    ReleaseSRWLockShared( &user->token_cache_lock );
+
+    if (FAILED( hr = export_proof_key_jwk( user->signing_key, &generated ) ))
+        XUSER_RETURN_HR_WHERE( "export_proof_key_jwk", hr );
+
+    AcquireSRWLockExclusive( &user->token_cache_lock );
+    if (!user->proof_key_json) user->proof_key_json = generated;
+    else free( generated );
+    generated = NULL;
+    ReleaseSRWLockExclusive( &user->token_cache_lock );
+
+    if (!(*proof_key_json = strdup( user->proof_key_json ))) XUSER_RETURN_HR_WHERE( "strdup", E_OUTOFMEMORY );
+    XUSER_RETURN_HR( S_OK );
+}
+
+static HRESULT find_cached_authorization( struct x_user *user, LPCSTR relying_party, BOOLEAN all_users, LPSTR *authorization )
+{
+    struct xsts_cache_entry *entry;
+    time_t now = time( NULL );
+
+    *authorization = NULL;
+    AcquireSRWLockShared( &user->token_cache_lock );
+    for (entry = user->token_cache; entry; entry = entry->next)
+    {
+        if (!strcmp( entry->relying_party, relying_party ) && entry->expiry > now + 60)
+        {
+            const char *cached = all_users ? entry->authorization_all : entry->authorization_single;
+
+            if (cached && (*authorization = strdup( cached )))
+            {
+                ReleaseSRWLockShared( &user->token_cache_lock );
+                XUSER_RETURN_HR( S_OK );
+            }
+            ReleaseSRWLockShared( &user->token_cache_lock );
+            XUSER_RETURN_HR_WHERE( "strdup", cached ? E_OUTOFMEMORY : E_FAIL );
+        }
+    }
+    ReleaseSRWLockShared( &user->token_cache_lock );
+    XUSER_RETURN_HR_WHERE( "cache miss", HRESULT_FROM_WIN32( ERROR_NOT_FOUND ) );
+}
+
+static HRESULT store_cached_authorization( struct x_user *user, LPCSTR relying_party,
+                                           LPCSTR authorization_single, LPCSTR authorization_all,
+                                           time_t expiry )
+{
+    struct xsts_cache_entry *entry;
+    HRESULT hr = S_OK;
+
+    if (!(entry = calloc( 1, sizeof( *entry ) ))) XUSER_RETURN_HR_WHERE( "calloc", E_OUTOFMEMORY );
+    if (!(entry->relying_party = strdup( relying_party )) ||
+        !(entry->authorization_single = strdup( authorization_single )) ||
+        !(entry->authorization_all = strdup( authorization_all )))
+    {
+        free_xsts_cache_entry( entry );
+        XUSER_RETURN_HR_WHERE( "strdup", E_OUTOFMEMORY );
+    }
+    entry->expiry = expiry;
+
+    AcquireSRWLockExclusive( &user->token_cache_lock );
+    for (struct xsts_cache_entry *iter = user->token_cache; iter; iter = iter->next)
+    {
+        if (!strcmp( iter->relying_party, relying_party ))
+        {
+            free( iter->authorization_single );
+            free( iter->authorization_all );
+            iter->authorization_single = entry->authorization_single;
+            iter->authorization_all = entry->authorization_all;
+            iter->expiry = expiry;
+            entry->authorization_single = NULL;
+            entry->authorization_all = NULL;
+            ReleaseSRWLockExclusive( &user->token_cache_lock );
+            free_xsts_cache_entry( entry );
+            XUSER_RETURN_HR( S_OK );
+        }
+    }
+    entry->next = user->token_cache;
+    user->token_cache = entry;
+    ReleaseSRWLockExclusive( &user->token_cache_lock );
+    XUSER_RETURN_HR( hr );
+}
+
 static HRESULT refresh_user_tokens( struct x_user *impl, BOOL force )
 {
     HSTRING refresh_token = NULL, oauth_token = NULL, user_token = NULL, xsts_token = NULL, user_hash = NULL, gamertag = NULL;
@@ -244,19 +370,33 @@ static HRESULT refresh_user_tokens( struct x_user *impl, BOOL force )
     HRESULT hr;
 
     now = time( NULL );
-    if (!force && impl->authorization && impl->oauth_token_expiry > now + 300) XUSER_RETURN_HR_WHERE( "cached", S_OK );
+    AcquireSRWLockExclusive( &impl->auth_lock );
+    if (!force && impl->authorization && impl->oauth_token_expiry > now + 300)
+    {
+        ReleaseSRWLockExclusive( &impl->auth_lock );
+        XUSER_RETURN_HR_WHERE( "cached", S_OK );
+    }
 
-    if (FAILED( hr = hstring_to_nul_string( impl->client_id, &client_id ) )) XUSER_RETURN_HR_WHERE( "client_id", hr );
+    if (FAILED( hr = hstring_to_nul_string( impl->client_id, &client_id ) ))
+    {
+        ReleaseSRWLockExclusive( &impl->auth_lock );
+        XUSER_RETURN_HR_WHERE( "client_id", hr );
+    }
     if (FAILED( hr = hstring_to_nul_string( impl->refresh_token, &old_refresh ) ))
     {
         free( client_id );
+        ReleaseSRWLockExclusive( &impl->auth_lock );
         XUSER_RETURN_HR_WHERE( "refresh_token", hr );
     }
 
     hr = RefreshOAuth( client_id, old_refresh, &expiry, &refresh_token, &oauth_token );
     free( client_id );
     free( old_refresh );
-    if (FAILED( hr )) XUSER_RETURN_HR_WHERE( "RefreshOAuth", E_GAMEUSER_FAILED_TO_GET_TOKEN );
+    if (FAILED( hr ))
+    {
+        ReleaseSRWLockExclusive( &impl->auth_lock );
+        XUSER_RETURN_HR_WHERE( "RefreshOAuth", E_GAMEUSER_FAILED_TO_GET_TOKEN );
+    }
 
     if (FAILED( hr = RequestUserToken( oauth_token, &user_token, &impl->local_id ) ))
     {
@@ -285,9 +425,15 @@ static HRESULT refresh_user_tokens( struct x_user *impl, BOOL force )
         impl->gamertag = gamertag;
     }
     impl->oauth_token_expiry = expiry;
+    clear_xsts_cache( impl );
 
-    if (FAILED( hr = SaveTokenStoreRefreshToken( impl->client_id, impl->refresh_token ) )) XUSER_RETURN_HR_WHERE( "SaveTokenStoreRefreshToken", hr );
+    if (FAILED( hr = SaveTokenStoreRefreshToken( impl->client_id, impl->refresh_token ) ))
+    {
+        ReleaseSRWLockExclusive( &impl->auth_lock );
+        XUSER_RETURN_HR_WHERE( "SaveTokenStoreRefreshToken", hr );
+    }
     hr = create_authorization_header( impl );
+    ReleaseSRWLockExclusive( &impl->auth_lock );
     XUSER_RETURN_HR_WHERE( "create_authorization_header", hr );
 
 failed:
@@ -297,6 +443,7 @@ failed:
     if (xsts_token) WindowsDeleteString( xsts_token );
     if (user_hash) WindowsDeleteString( user_hash );
     if (gamertag) WindowsDeleteString( gamertag );
+    ReleaseSRWLockExclusive( &impl->auth_lock );
     XUSER_RETURN_HR_WHERE( "failed", E_GAMEUSER_FAILED_TO_GET_TOKEN );
 }
 
@@ -335,6 +482,8 @@ static HRESULT create_default_user( struct x_user **out, XUserAddOptions options
     impl->cached_default = TRUE;
     impl->client_id = client_id;
     impl->refresh_token = refresh_token;
+    impl->auth_lock = (SRWLOCK)SRWLOCK_INIT;
+    impl->token_cache_lock = (SRWLOCK)SRWLOCK_INIT;
 
     if (FAILED( hr = create_signing_key( &impl->signing_key ) ) ||
         FAILED( hr = refresh_user_tokens( impl, TRUE ) ))
@@ -1042,12 +1191,80 @@ static HRESULT utf16_headers_to_utf8( const XUserGetTokenAndSignatureUtf16HttpHe
     XUSER_RETURN_HR( S_OK );
 }
 
+static HRESULT get_authorization_for_url( struct x_user *user, LPCWSTR url, BOOLEAN all_users,
+                                          BOOLEAN force_refresh, LPSTR *authorization )
+{
+    HSTRING request_xsts = NULL, request_user_hash = NULL;
+    LPSTR request_xsts_str = NULL, request_user_hash_str = NULL;
+    LPSTR proof_key_json = NULL, relying_party = NULL;
+    LPSTR authorization_single = NULL, authorization_all = NULL;
+    time_t expiry = 0;
+    HRESULT hr;
+
+    *authorization = NULL;
+    if (FAILED( hr = ResolveRelyingPartyForUrl( url, &relying_party ) ))
+        XUSER_RETURN_HR_WHERE( "ResolveRelyingPartyForUrl", hr );
+    if (!force_refresh && SUCCEEDED( hr = find_cached_authorization( user, relying_party, all_users, authorization ) ))
+    {
+        free( relying_party );
+        XUSER_RETURN_HR( S_OK );
+    }
+
+    if (FAILED( hr = get_cached_proof_key_json( user, &proof_key_json ) ))
+    {
+        free( relying_party );
+        XUSER_RETURN_HR_WHERE( "get_cached_proof_key_json", hr );
+    }
+    if (FAILED( hr = RequestXstsTokenForUrlWithProofKey( user->user_token, url, proof_key_json,
+                                                         &request_xsts, &request_user_hash, &expiry ) ))
+    {
+        free( proof_key_json );
+        free( relying_party );
+        XUSER_RETURN_HR_WHERE( "RequestXstsTokenForUrlWithProofKey", hr );
+    }
+    free( proof_key_json );
+    if (FAILED( hr = hstring_to_nul_string( request_xsts, &request_xsts_str ) ))
+    {
+        WindowsDeleteString( request_xsts );
+        WindowsDeleteString( request_user_hash );
+        free( relying_party );
+        XUSER_RETURN_HR_WHERE( "request_xsts_str", hr );
+    }
+    WindowsDeleteString( request_xsts );
+    if (FAILED( hr = hstring_to_nul_string( request_user_hash, &request_user_hash_str ) ))
+    {
+        free( request_xsts_str );
+        WindowsDeleteString( request_user_hash );
+        free( relying_party );
+        XUSER_RETURN_HR_WHERE( "request_user_hash_str", hr );
+    }
+    WindowsDeleteString( request_user_hash );
+    if (FAILED( hr = create_authorization_string( request_user_hash_str, request_xsts_str, FALSE, &authorization_single ) ) ||
+        FAILED( hr = create_authorization_string( request_user_hash_str, request_xsts_str, TRUE, &authorization_all ) ))
+    {
+        free( request_user_hash_str );
+        free( request_xsts_str );
+        free( authorization_single );
+        free( relying_party );
+        XUSER_RETURN_HR_WHERE( "create_authorization_string", hr );
+    }
+    free( request_user_hash_str );
+    free( request_xsts_str );
+    if (!expiry) expiry = user->oauth_token_expiry;
+    store_cached_authorization( user, relying_party, authorization_single, authorization_all, expiry );
+    *authorization = strdup( all_users ? authorization_all : authorization_single );
+    free( authorization_single );
+    free( authorization_all );
+    free( relying_party );
+    if (!*authorization) XUSER_RETURN_HR_WHERE( "strdup", E_OUTOFMEMORY );
+    XUSER_RETURN_HR( S_OK );
+}
+
 static HRESULT token_context_prepare_result( struct XUserGetTokenAndSignatureContext *context )
 {
     struct x_user *user = context->user;
-    HSTRING request_xsts = NULL, request_user_hash = NULL;
-    LPSTR request_xsts_str = NULL, request_user_hash_str = NULL, proof_key_json = NULL;
     XUserGetTokenAndSignatureHttpHeader *utf8_headers = NULL;
+    static const WCHAR default_token_only_url[] = L"https://xboxlive.com/";
     LPWSTR url_w = NULL;
     LPSTR method = NULL;
     HRESULT hr;
@@ -1060,44 +1277,12 @@ static HRESULT token_context_prepare_result( struct XUserGetTokenAndSignatureCon
 
     if ((!context->utf16 && !context->url[0]) || (context->utf16 && !context->url_utf16[0]))
     {
-        if (FAILED( hr = export_proof_key_jwk( user->signing_key, &proof_key_json ) ))
-        {
-            FIXME( "export_proof_key_jwk failed %#lx\n", hr );
-            XUSER_RETURN_HR_WHERE( "export_proof_key_jwk", hr );
-        }
-        if (FAILED( hr = RequestXstsTokenForUrlWithProofKey( user->user_token,
-                                                             context->utf16 ? context->url_utf16 : L"https://xboxlive.com/",
-                                                             proof_key_json, &request_xsts, &request_user_hash ) ))
-        {
-            free( proof_key_json );
-            FIXME( "RequestXstsTokenForUrlWithProofKey failed %#lx\n", hr );
-            XUSER_RETURN_HR_WHERE( "RequestXstsTokenForUrlWithProofKey", hr );
-        }
-        free( proof_key_json );
-        if (FAILED( hr = hstring_to_nul_string( request_xsts, &request_xsts_str ) ))
-        {
-            WindowsDeleteString( request_xsts );
-            WindowsDeleteString( request_user_hash );
-            XUSER_RETURN_HR_WHERE( "request_xsts_str", hr );
-        }
-        WindowsDeleteString( request_xsts );
-        if (FAILED( hr = hstring_to_nul_string( request_user_hash, &request_user_hash_str ) ))
-        {
-            free( request_xsts_str );
-            WindowsDeleteString( request_user_hash );
-            XUSER_RETURN_HR_WHERE( "request_user_hash_str", hr );
-        }
-        WindowsDeleteString( request_user_hash );
-        if (FAILED( hr = create_authorization_string( request_user_hash_str, request_xsts_str,
-                                                      !!(context->options & XUserGetTokenAndSignatureOptions_AllUsers),
-                                                      &context->authorization ) ))
-        {
-            free( request_user_hash_str );
-            free( request_xsts_str );
-            XUSER_RETURN_HR_WHERE( "create_authorization_string", hr );
-        }
-        free( request_user_hash_str );
-        free( request_xsts_str );
+        if (FAILED( hr = get_authorization_for_url( user,
+                                                    context->utf16 ? default_token_only_url : L"https://xboxlive.com/",
+                                                    !!(context->options & XUserGetTokenAndSignatureOptions_AllUsers),
+                                                    !!(context->options & XUserGetTokenAndSignatureOptions_ForceRefresh),
+                                                    &context->authorization ) ))
+            XUSER_RETURN_HR_WHERE( "get_authorization_for_url", hr );
         if (!(context->token = strdup( context->authorization ? context->authorization : "" )))
         {
             FIXME( "token strdup failed\n" );
@@ -1166,54 +1351,15 @@ static HRESULT token_context_prepare_result( struct XUserGetTokenAndSignatureCon
         }
     }
 
-    if (FAILED( hr = export_proof_key_jwk( user->signing_key, &proof_key_json ) ))
+    if (FAILED( hr = get_authorization_for_url( user, context->utf16 ? context->url_utf16 : url_w,
+                                                !!(context->options & XUserGetTokenAndSignatureOptions_AllUsers),
+                                                !!(context->options & XUserGetTokenAndSignatureOptions_ForceRefresh),
+                                                &context->authorization ) ))
     {
         free( method );
         if (!context->utf16) free( url_w );
-        FIXME( "export_proof_key_jwk failed %#lx\n", hr );
-        XUSER_RETURN_HR_WHERE( "export_proof_key_jwk", hr );
+        XUSER_RETURN_HR_WHERE( "get_authorization_for_url", hr );
     }
-    if (FAILED( hr = RequestXstsTokenForUrlWithProofKey( user->user_token,
-                                                         context->utf16 ? context->url_utf16 : url_w,
-                                                         proof_key_json, &request_xsts, &request_user_hash ) ))
-    {
-        free( proof_key_json );
-        free( method );
-        if (!context->utf16) free( url_w );
-        FIXME( "RequestXstsTokenForUrlWithProofKey failed %#lx\n", hr );
-        XUSER_RETURN_HR_WHERE( "RequestXstsTokenForUrlWithProofKey", hr );
-    }
-    free( proof_key_json );
-    if (FAILED( hr = hstring_to_nul_string( request_xsts, &request_xsts_str ) ))
-    {
-        WindowsDeleteString( request_xsts );
-        WindowsDeleteString( request_user_hash );
-        free( method );
-        if (!context->utf16) free( url_w );
-        XUSER_RETURN_HR_WHERE( "request_xsts_str", hr );
-    }
-    WindowsDeleteString( request_xsts );
-    if (FAILED( hr = hstring_to_nul_string( request_user_hash, &request_user_hash_str ) ))
-    {
-        free( request_xsts_str );
-        WindowsDeleteString( request_user_hash );
-        free( method );
-        if (!context->utf16) free( url_w );
-        XUSER_RETURN_HR_WHERE( "request_user_hash_str", hr );
-    }
-    WindowsDeleteString( request_user_hash );
-    if (FAILED( hr = create_authorization_string( request_user_hash_str, request_xsts_str,
-                                                  !!(context->options & XUserGetTokenAndSignatureOptions_AllUsers),
-                                                  &context->authorization ) ))
-    {
-        free( request_user_hash_str );
-        free( request_xsts_str );
-        free( method );
-        if (!context->utf16) free( url_w );
-        XUSER_RETURN_HR_WHERE( "create_authorization_string", hr );
-    }
-    free( request_user_hash_str );
-    free( request_xsts_str );
 
     if (!(context->token = strdup( context->authorization ? context->authorization : "" )))
     {

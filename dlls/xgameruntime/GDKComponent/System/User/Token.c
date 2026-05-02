@@ -208,7 +208,7 @@ static HRESULT get_relying_party_override( LPCSTR host, LPSTR *relying_party )
     return S_OK;
 }
 
-static HRESULT get_relying_party_for_url( LPCWSTR url, LPSTR *relying_party )
+HRESULT ResolveRelyingPartyForUrl( LPCWSTR url, LPSTR *relying_party )
 {
     URL_COMPONENTSW components = {0};
     LPSTR host = NULL, scheme = NULL;
@@ -1173,23 +1173,47 @@ HRESULT RequestXstsTokenWithUserHash( HSTRING user_token, HSTRING *token, HSTRIN
     return hr;
 }
 
+static HRESULT parse_iso8601_utc( LPCSTR str, time_t *value )
+{
+    ULARGE_INTEGER filetime;
+    FILETIME ft;
+    SYSTEMTIME st = {0};
+    int year, month, day, hour, minute, second;
+
+    if (sscanf( str, "%d-%d-%dT%d:%d:%d", &year, &month, &day, &hour, &minute, &second ) != 6)
+        return E_FAIL;
+    st.wYear = year;
+    st.wMonth = month;
+    st.wDay = day;
+    st.wHour = hour;
+    st.wMinute = minute;
+    st.wSecond = second;
+    if (!SystemTimeToFileTime( &st, &ft )) return HRESULT_FROM_WIN32( GetLastError() );
+    filetime.LowPart = ft.dwLowDateTime;
+    filetime.HighPart = ft.dwHighDateTime;
+    *value = (time_t)((filetime.QuadPart - 116444736000000000ULL) / 10000000ULL);
+    return S_OK;
+}
+
 HRESULT RequestXstsTokenForUrlWithProofKey( HSTRING user_token, LPCWSTR url, LPCSTR proof_key,
-                                            HSTRING *token, HSTRING *user_hash )
+                                            HSTRING *token, HSTRING *user_hash, time_t *expiry )
 {
     LPCWSTR accept[] = {L"application/json", NULL};
     const char *template = "{\"RelyingParty\":\"%s\",\"TokenType\":\"JWT\",\"Properties\":{\"SandboxId\":\"RETAIL\",\"UserTokens\":[\"%s\"]},\"ProofKey\":%s}";
     UINT32 token_str_len;
-    LPSTR relying_party = NULL, token_str = NULL, data = NULL, buffer = NULL;
+    LPSTR relying_party = NULL, token_str = NULL, data = NULL, buffer = NULL, not_after = NULL;
     IJsonObject *display_claims = NULL, *root = NULL, *user = NULL;
     IJsonArray *xui = NULL;
+    HSTRING not_after_hstr = NULL;
     SIZE_T size;
     HRESULT hr;
     size_t data_size;
 
     *token = NULL;
     *user_hash = NULL;
+    if (expiry) *expiry = 0;
 
-    if (FAILED( hr = get_relying_party_for_url( url, &relying_party ) )) return hr;
+    if (FAILED( hr = ResolveRelyingPartyForUrl( url, &relying_party ) )) return hr;
     if (FAILED( hr = HSTRINGToMultiByte( user_token, &token_str, &token_str_len ) ))
     {
         free( relying_party );
@@ -1226,12 +1250,21 @@ HRESULT RequestXstsTokenForUrlWithProofKey( HSTRING user_token, LPCWSTR url, LPC
     if (FAILED( hr )) return hr;
 
     if (FAILED( hr = GetJsonStringValue( root, L"Token", token ) )) goto failed;
+    if (expiry && SUCCEEDED( hr = GetJsonStringValue( root, L"NotAfter", &not_after_hstr ) ))
+    {
+        if (SUCCEEDED( HStringToNulString( not_after_hstr, &not_after ) ))
+            parse_iso8601_utc( not_after, expiry );
+        free( not_after );
+        WindowsDeleteString( not_after_hstr );
+        not_after_hstr = NULL;
+    }
     if (FAILED( hr = GetJsonObjectValue( root, L"DisplayClaims", &display_claims ) )) goto failed;
     if (FAILED( hr = GetJsonArrayValue( display_claims, L"xui", &xui ) )) goto failed;
     if (FAILED( hr = IJsonArray_GetObjectAt( xui, 0, &user ) )) goto failed;
     hr = GetJsonStringValue( user, L"uhs", user_hash );
 
 failed:
+    if (not_after_hstr) WindowsDeleteString( not_after_hstr );
     if (root) IJsonObject_Release( root );
     if (display_claims) IJsonObject_Release( display_claims );
     if (xui) IJsonArray_Release( xui );
@@ -1243,6 +1276,7 @@ failed:
         if (*user_hash) WindowsDeleteString( *user_hash );
         *user_hash = NULL;
     }
+    free( not_after );
     return hr;
 }
 

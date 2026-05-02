@@ -28,6 +28,15 @@
 #include "Token.h"
 #include <bcrypt.h>
 
+struct xsts_cache_entry
+{
+    struct xsts_cache_entry *next;
+    LPSTR relying_party;
+    LPSTR authorization_single;
+    LPSTR authorization_all;
+    time_t expiry;
+};
+
 struct x_user
 {
     IXUserImpl IXUserImpl_iface;
@@ -47,6 +56,10 @@ struct x_user
     HSTRING gamertag;
     HSTRING client_id;
     LPSTR authorization;
+    LPSTR proof_key_json;
+    SRWLOCK auth_lock;
+    SRWLOCK token_cache_lock;
+    struct xsts_cache_entry *token_cache;
     BCRYPT_KEY_HANDLE signing_key;
     BOOL heap_allocated;
     BOOL cached_default;
