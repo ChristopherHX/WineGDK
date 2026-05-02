@@ -1635,6 +1635,7 @@
 @ cdecl _o_fread(ptr long long ptr) fread
 @ cdecl _o_fread_s(ptr long long long ptr) fread_s
 @ cdecl _o_free(ptr) free
+@ cdecl _free_dbg(ptr) free
 @ cdecl _o_freopen(str str ptr) freopen
 @ cdecl _o_freopen_s(ptr str str ptr) freopen_s
 @ cdecl _o_frexp(double ptr) frexp
