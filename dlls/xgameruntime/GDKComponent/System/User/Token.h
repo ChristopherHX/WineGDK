@@ -36,6 +36,8 @@ HRESULT RefreshOAuth( LPCSTR client_id, LPCSTR refresh_token, time_t *new_expiry
 HRESULT RequestUserToken( HSTRING oauth_token, HSTRING *token, XUserLocalId *localId );
 HRESULT RequestXstsToken( HSTRING user_token, HSTRING *token, UINT64 *xuid, XUserAgeGroup *age_group );
 HRESULT RequestXstsTokenWithUserHash( HSTRING user_token, HSTRING *token, HSTRING *user_hash, HSTRING *gamertag, UINT64 *xuid, XUserAgeGroup *age_group );
+HRESULT RequestXstsTokenForUrlWithProofKey( HSTRING user_token, LPCWSTR url, LPCSTR proof_key,
+                                            HSTRING *token, HSTRING *user_hash );
 HRESULT LoadTokenStore( LPCSTR path, HSTRING *client_id, HSTRING *refresh_token );
 HRESULT LoadClientIdFromGameConfig( HSTRING *client_id );
 HRESULT DeviceCodeLoginAndSaveTokenStore( HSTRING client_id, LPCSTR path );

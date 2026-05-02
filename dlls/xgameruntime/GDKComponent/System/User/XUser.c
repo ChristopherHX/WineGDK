@@ -47,6 +47,10 @@ static HRESULT xuser_log_hr( const char *func, const char *where, HRESULT hr )
     return hr;
 }
 
+void WINAPI __debug_check(HRESULT hr) {
+
+}
+
 #define XUSER_RETURN_HR(hr) return xuser_log_hr( __func__, "", (hr) )
 #define XUSER_RETURN_HR_WHERE(where, hr) return xuser_log_hr( __func__, (where), (hr) )
 
@@ -116,6 +120,19 @@ static HRESULT create_authorization_header( struct x_user *impl )
     XUSER_RETURN_HR( S_OK );
 }
 
+static HRESULT create_authorization_string( LPCSTR user_hash, LPCSTR token, BOOLEAN all_users, LPSTR *authorization )
+{
+    const char *hash = all_users ? "*" : user_hash;
+    SIZE_T size;
+
+    *authorization = NULL;
+    if (!hash || !token) XUSER_RETURN_HR_WHERE( "args", E_POINTER );
+    size = strlen( "XBL3.0 x=;" ) + strlen( hash ) + strlen( token ) + 1;
+    if (!(*authorization = calloc( size, sizeof( CHAR ) ))) XUSER_RETURN_HR_WHERE( "calloc", E_OUTOFMEMORY );
+    snprintf( *authorization, size, "XBL3.0 x=%s;%s", hash, token );
+    XUSER_RETURN_HR( S_OK );
+}
+
 static HRESULT create_signing_key( BCRYPT_KEY_HANDLE *key )
 {
     BCRYPT_ALG_HANDLE alg = NULL;
@@ -138,6 +155,85 @@ static HRESULT create_signing_key( BCRYPT_KEY_HANDLE *key )
         XUSER_RETURN_HR_WHERE( "BCryptFinalizeKeyPair", HRESULT_FROM_NT( status ) );
     }
     XUSER_RETURN_HR( S_OK );
+}
+
+static HRESULT base64url_encode( const BYTE *buffer, DWORD size, LPSTR *encoded )
+{
+    DWORD base64_size;
+
+    *encoded = NULL;
+    if (!CryptBinaryToStringA( buffer, size, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, NULL, &base64_size ))
+        XUSER_RETURN_HR_WHERE( "CryptBinaryToStringA size", HRESULT_FROM_WIN32( GetLastError() ) );
+    if (!(*encoded = calloc( base64_size + 1, sizeof( CHAR ) ))) XUSER_RETURN_HR_WHERE( "calloc", E_OUTOFMEMORY );
+    if (!CryptBinaryToStringA( buffer, size, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, *encoded, &base64_size ))
+    {
+        free( *encoded );
+        *encoded = NULL;
+        XUSER_RETURN_HR_WHERE( "CryptBinaryToStringA", HRESULT_FROM_WIN32( GetLastError() ) );
+    }
+
+    for (DWORD i = 0; i < base64_size; ++i)
+    {
+        if ((*encoded)[i] == '+') (*encoded)[i] = '-';
+        else if ((*encoded)[i] == '/') (*encoded)[i] = '_';
+        else if ((*encoded)[i] == '=')
+        {
+            (*encoded)[i] = 0;
+            break;
+        }
+    }
+
+    XUSER_RETURN_HR( S_OK );
+}
+
+static HRESULT export_proof_key_jwk( BCRYPT_KEY_HANDLE key, LPSTR *proof_key_json )
+{
+    BCRYPT_ECCKEY_BLOB *blob;
+    DWORD blob_size = 0;
+    BYTE *buffer = NULL;
+    LPSTR x = NULL, y = NULL;
+    HRESULT hr = S_OK;
+    size_t json_size;
+    NTSTATUS status;
+
+    *proof_key_json = NULL;
+    status = BCryptExportKey( key, NULL, BCRYPT_ECCPUBLIC_BLOB, NULL, 0, &blob_size, 0 );
+    if (status)
+        XUSER_RETURN_HR_WHERE( "BCryptExportKey size", E_FAIL );
+    if (!(buffer = calloc( blob_size, sizeof( BYTE ) ))) XUSER_RETURN_HR_WHERE( "calloc", E_OUTOFMEMORY );
+    status = BCryptExportKey( key, NULL, BCRYPT_ECCPUBLIC_BLOB, buffer, blob_size, &blob_size, 0 );
+    if (status)
+    {
+        free( buffer );
+        XUSER_RETURN_HR_WHERE( "BCryptExportKey", E_FAIL );
+    }
+
+    blob = (BCRYPT_ECCKEY_BLOB *)buffer;
+    if (blob->dwMagic != BCRYPT_ECDSA_PUBLIC_P256_MAGIC)
+    {
+        free( buffer );
+        XUSER_RETURN_HR_WHERE( "dwMagic", E_FAIL );
+    }
+    if (FAILED( hr = base64url_encode( buffer + sizeof( *blob ), blob->cbKey, &x ) )) goto done;
+    if (FAILED( hr = base64url_encode( buffer + sizeof( *blob ) + blob->cbKey, blob->cbKey, &y ) )) goto done;
+
+    json_size = snprintf( NULL, 0,
+                          "{\"alg\":\"ES256\",\"kty\":\"EC\",\"use\":\"sig\",\"crv\":\"P-256\",\"x\":\"%s\",\"y\":\"%s\"}",
+                          x, y ) + 1;
+    if (!(*proof_key_json = calloc( json_size, sizeof( CHAR ) )))
+    {
+        hr = E_OUTOFMEMORY;
+        goto done;
+    }
+    snprintf( *proof_key_json, json_size,
+              "{\"alg\":\"ES256\",\"kty\":\"EC\",\"use\":\"sig\",\"crv\":\"P-256\",\"x\":\"%s\",\"y\":\"%s\"}",
+              x, y );
+
+done:
+    free( x );
+    free( y );
+    free( buffer );
+    XUSER_RETURN_HR( hr );
 }
 
 static HRESULT refresh_user_tokens( struct x_user *impl, BOOL force )
@@ -554,15 +650,16 @@ struct XUserGetTokenAndSignatureContext
     BOOLEAN utf16;
     XUserHandle user;
     XUserGetTokenAndSignatureOptions options;
-    LPCSTR method;
-    LPCWSTR method_utf16;
-    LPCSTR url;
-    LPCWSTR url_utf16;
+    LPSTR method;
+    LPWSTR method_utf16;
+    LPSTR url;
+    LPWSTR url_utf16;
     SIZE_T count;
     XUserGetTokenAndSignatureHttpHeader *headers;
     XUserGetTokenAndSignatureUtf16HttpHeader *headers_utf16;
     SIZE_T size;
-    const void *buffer;
+    void *buffer;
+    LPSTR authorization;
     LPSTR token;
     LPSTR signature;
     LPWSTR token_utf16;
@@ -615,7 +712,10 @@ static HRESULT get_path_and_query( LPCWSTR url, LPSTR *path_and_query )
     components.dwUrlPathLength = -1;
     components.dwExtraInfoLength = -1;
 
-    if (!WinHttpCrackUrl( url, 0, 0, &components )) return HRESULT_FROM_WIN32( GetLastError() );
+    if (!WinHttpCrackUrl( url, 0, 0, &components )) {
+        FIXME( "url %s\n", debugstr_w( url ) );
+        return HRESULT_FROM_WIN32( GetLastError() );
+    }
     len = components.dwUrlPathLength + components.dwExtraInfoLength;
     if (!len) return E_FAIL;
     if (!(wide = calloc( len + 1, sizeof( WCHAR ) ))) return E_OUTOFMEMORY;
@@ -636,7 +736,9 @@ static HRESULT get_path_and_query( LPCWSTR url, LPSTR *path_and_query )
     return hr;
 }
 
-static HRESULT sign_request( struct x_user *user, LPCSTR method, LPCWSTR url, const void *body, SIZE_T body_size, LPSTR *signature )
+static HRESULT sign_request( struct x_user *user, LPCSTR authorization, LPCSTR method, LPCWSTR url,
+                             SIZE_T header_count, const XUserGetTokenAndSignatureHttpHeader *headers,
+                             const void *body, SIZE_T body_size, LPSTR *signature )
 {
     BYTE version[4] = {0, 0, 0, XUSER_SIGNATURE_POLICY_VERSION};
     BYTE timestamp[8], hash[32], *message = NULL, *ptr, *sig = NULL, *blob = NULL;
@@ -644,7 +746,7 @@ static HRESULT sign_request( struct x_user *user, LPCSTR method, LPCWSTR url, co
     ULARGE_INTEGER filetime_int;
     FILETIME filetime;
     LPSTR path_and_query = NULL, method_upper = NULL;
-    SIZE_T method_len, path_len, auth_len, body_hash_size, message_size;
+    SIZE_T method_len, path_len, auth_len, body_hash_size, message_size, i;
     HRESULT hr;
     NTSTATUS status;
 
@@ -666,9 +768,10 @@ static HRESULT sign_request( struct x_user *user, LPCSTR method, LPCWSTR url, co
     for (int i = 0; i < 8; i++) timestamp[i] = (BYTE)(filetime_int.QuadPart >> ((7 - i) * 8));
 
     path_len = strlen( path_and_query );
-    auth_len = user->authorization ? strlen( user->authorization ) : 0;
+    auth_len = authorization ? strlen( authorization ) : 0;
     body_hash_size = body_size < XUSER_SIGNATURE_MAX_BODY_BYTES ? body_size : XUSER_SIGNATURE_MAX_BODY_BYTES;
     message_size = sizeof( version ) + 1 + sizeof( timestamp ) + 1 + method_len + 1 + path_len + 1 + auth_len + 1 + body_hash_size + 1;
+    for (i = 0; i < header_count; ++i) message_size += strlen( headers[i].value ? headers[i].value : "" ) + 1;
     if (!(message = calloc( 1, message_size )))
     {
         hr = E_OUTOFMEMORY;
@@ -679,8 +782,15 @@ static HRESULT sign_request( struct x_user *user, LPCSTR method, LPCWSTR url, co
     append_bytes( &ptr, timestamp, sizeof( timestamp ) ); ptr++;
     append_bytes( &ptr, method_upper, method_len ); ptr++;
     append_bytes( &ptr, path_and_query, path_len ); ptr++;
-    if (auth_len) append_bytes( &ptr, user->authorization, auth_len );
+    if (auth_len) append_bytes( &ptr, authorization, auth_len );
     ptr++;
+    for (i = 0; i < header_count; ++i)
+    {
+        SIZE_T header_len = strlen( headers[i].value ? headers[i].value : "" );
+
+        if (header_len) append_bytes( &ptr, headers[i].value, header_len );
+        ptr++;
+    }
     if (body_hash_size) append_bytes( &ptr, body, body_hash_size );
 
     if (FAILED( hr = sha256_hash( message, message_size, hash ) )) goto done;
@@ -794,9 +904,150 @@ static HRESULT wide_to_utf8( LPCWSTR wide, LPSTR *str )
     XUSER_RETURN_HR( S_OK );
 }
 
+static HRESULT wide_strdup( LPCWSTR wide, LPWSTR *copy )
+{
+    SIZE_T len;
+
+    *copy = NULL;
+    if ( !wide ) XUSER_RETURN_HR_WHERE( "wide", E_POINTER );
+    len = wcslen( wide ) + 1;
+    if ( !(*copy = calloc( len, sizeof( WCHAR ) )) ) XUSER_RETURN_HR_WHERE( "calloc", E_OUTOFMEMORY );
+    memcpy( *copy, wide, len * sizeof( WCHAR ) );
+    XUSER_RETURN_HR( S_OK );
+}
+
+static void free_ansi_headers( XUserGetTokenAndSignatureHttpHeader *headers, SIZE_T count )
+{
+    SIZE_T i;
+
+    if (!headers) return;
+    for (i = 0; i < count; ++i)
+    {
+        free( (void *)headers[i].name );
+        free( (void *)headers[i].value );
+    }
+    free( headers );
+}
+
+static void free_utf16_headers( XUserGetTokenAndSignatureUtf16HttpHeader *headers, SIZE_T count )
+{
+    SIZE_T i;
+
+    if (!headers) return;
+    for (i = 0; i < count; ++i)
+    {
+        free( (void *)headers[i].name );
+        free( (void *)headers[i].value );
+    }
+    free( headers );
+}
+
+static HRESULT copy_ansi_headers( struct XUserGetTokenAndSignatureContext *context,
+                                  const XUserGetTokenAndSignatureHttpHeader *headers )
+{
+    SIZE_T i;
+
+    if (!context->count) return S_OK;
+    if (!(context->headers = calloc( context->count, sizeof( *context->headers ) )))
+        XUSER_RETURN_HR_WHERE( "headers calloc", E_OUTOFMEMORY );
+
+    for (i = 0; i < context->count; ++i)
+    {
+        if (!(context->headers[i].name = strdup( headers[i].name ? headers[i].name : "" )))
+        {
+            free_ansi_headers( context->headers, i );
+            context->headers = NULL;
+            XUSER_RETURN_HR_WHERE( "header name strdup", E_OUTOFMEMORY );
+        }
+        if (!(context->headers[i].value = strdup( headers[i].value ? headers[i].value : "" )))
+        {
+            free_ansi_headers( context->headers, i + 1 );
+            context->headers = NULL;
+            XUSER_RETURN_HR_WHERE( "header value strdup", E_OUTOFMEMORY );
+        }
+    }
+
+    XUSER_RETURN_HR( S_OK );
+}
+
+static HRESULT copy_utf16_headers( struct XUserGetTokenAndSignatureContext *context,
+                                   const XUserGetTokenAndSignatureUtf16HttpHeader *headers )
+{
+    SIZE_T i;
+    HRESULT hr;
+
+    if (!context->count) return S_OK;
+    if (!(context->headers_utf16 = calloc( context->count, sizeof( *context->headers_utf16 ) )))
+        XUSER_RETURN_HR_WHERE( "headers calloc", E_OUTOFMEMORY );
+
+    for (i = 0; i < context->count; ++i)
+    {
+        if (FAILED( hr = wide_strdup( headers[i].name ? headers[i].name : L"", (LPWSTR *)&context->headers_utf16[i].name ) ))
+        {
+            free_utf16_headers( context->headers_utf16, i );
+            context->headers_utf16 = NULL;
+            XUSER_RETURN_HR_WHERE( "header name wide strdup", hr );
+        }
+        if (FAILED( hr = wide_strdup( headers[i].value ? headers[i].value : L"", (LPWSTR *)&context->headers_utf16[i].value ) ))
+        {
+            free_utf16_headers( context->headers_utf16, i + 1 );
+            context->headers_utf16 = NULL;
+            XUSER_RETURN_HR_WHERE( "header value wide strdup", hr );
+        }
+    }
+
+    XUSER_RETURN_HR( S_OK );
+}
+
+static HRESULT copy_request_buffer( struct XUserGetTokenAndSignatureContext *context,
+                                    const void *buffer, SIZE_T size )
+{
+    if (!size)
+    {
+        context->buffer = NULL;
+        XUSER_RETURN_HR( S_OK );
+    }
+
+    if (!(context->buffer = malloc( size ))) XUSER_RETURN_HR_WHERE( "buffer malloc", E_OUTOFMEMORY );
+    memcpy( context->buffer, buffer, size );
+    XUSER_RETURN_HR( S_OK );
+}
+
+static HRESULT utf16_headers_to_utf8( const XUserGetTokenAndSignatureUtf16HttpHeader *headers_utf16,
+                                      SIZE_T count, XUserGetTokenAndSignatureHttpHeader **headers )
+{
+    SIZE_T i;
+    HRESULT hr;
+
+    *headers = NULL;
+    if (!count) return S_OK;
+    if (!(*headers = calloc( count, sizeof( **headers ) ))) XUSER_RETURN_HR_WHERE( "calloc", E_OUTOFMEMORY );
+
+    for (i = 0; i < count; ++i)
+    {
+        if (FAILED( hr = wide_to_utf8( headers_utf16[i].name, (LPSTR *)&(*headers)[i].name ) ) ||
+            FAILED( hr = wide_to_utf8( headers_utf16[i].value, (LPSTR *)&(*headers)[i].value ) ))
+        {
+            for (SIZE_T j = 0; j <= i; ++j)
+            {
+                free( (void *)(*headers)[j].name );
+                free( (void *)(*headers)[j].value );
+            }
+            free( *headers );
+            *headers = NULL;
+            XUSER_RETURN_HR_WHERE( "wide_to_utf8", hr );
+        }
+    }
+
+    XUSER_RETURN_HR( S_OK );
+}
+
 static HRESULT token_context_prepare_result( struct XUserGetTokenAndSignatureContext *context )
 {
     struct x_user *user = context->user;
+    HSTRING request_xsts = NULL, request_user_hash = NULL;
+    LPSTR request_xsts_str = NULL, request_user_hash_str = NULL, proof_key_json = NULL;
+    XUserGetTokenAndSignatureHttpHeader *utf8_headers = NULL;
     LPWSTR url_w = NULL;
     LPSTR method = NULL;
     HRESULT hr;
@@ -807,14 +1058,51 @@ static HRESULT token_context_prepare_result( struct XUserGetTokenAndSignatureCon
         XUSER_RETURN_HR_WHERE( "refresh_user_tokens", hr );
     }
 
-    if (!(context->token = strdup( user->authorization ? user->authorization : "" )))
-    {
-        FIXME( "token strdup failed\n" );
-        XUSER_RETURN_HR_WHERE( "token strdup", E_OUTOFMEMORY );
-    }
-
     if ((!context->utf16 && !context->url[0]) || (context->utf16 && !context->url_utf16[0]))
     {
+        if (FAILED( hr = export_proof_key_jwk( user->signing_key, &proof_key_json ) ))
+        {
+            FIXME( "export_proof_key_jwk failed %#lx\n", hr );
+            XUSER_RETURN_HR_WHERE( "export_proof_key_jwk", hr );
+        }
+        if (FAILED( hr = RequestXstsTokenForUrlWithProofKey( user->user_token,
+                                                             context->utf16 ? context->url_utf16 : L"https://xboxlive.com/",
+                                                             proof_key_json, &request_xsts, &request_user_hash ) ))
+        {
+            free( proof_key_json );
+            FIXME( "RequestXstsTokenForUrlWithProofKey failed %#lx\n", hr );
+            XUSER_RETURN_HR_WHERE( "RequestXstsTokenForUrlWithProofKey", hr );
+        }
+        free( proof_key_json );
+        if (FAILED( hr = hstring_to_nul_string( request_xsts, &request_xsts_str ) ))
+        {
+            WindowsDeleteString( request_xsts );
+            WindowsDeleteString( request_user_hash );
+            XUSER_RETURN_HR_WHERE( "request_xsts_str", hr );
+        }
+        WindowsDeleteString( request_xsts );
+        if (FAILED( hr = hstring_to_nul_string( request_user_hash, &request_user_hash_str ) ))
+        {
+            free( request_xsts_str );
+            WindowsDeleteString( request_user_hash );
+            XUSER_RETURN_HR_WHERE( "request_user_hash_str", hr );
+        }
+        WindowsDeleteString( request_user_hash );
+        if (FAILED( hr = create_authorization_string( request_user_hash_str, request_xsts_str,
+                                                      !!(context->options & XUserGetTokenAndSignatureOptions_AllUsers),
+                                                      &context->authorization ) ))
+        {
+            free( request_user_hash_str );
+            free( request_xsts_str );
+            XUSER_RETURN_HR_WHERE( "create_authorization_string", hr );
+        }
+        free( request_user_hash_str );
+        free( request_xsts_str );
+        if (!(context->token = strdup( context->authorization ? context->authorization : "" )))
+        {
+            FIXME( "token strdup failed\n" );
+            XUSER_RETURN_HR_WHERE( "token strdup", E_OUTOFMEMORY );
+        }
         FIXME( "token-only request, utf16 %u\n", context->utf16 );
         if (!(context->signature = strdup( "" )))
         {
@@ -878,7 +1166,84 @@ static HRESULT token_context_prepare_result( struct XUserGetTokenAndSignatureCon
         }
     }
 
-    hr = sign_request( user, method, url_w, context->buffer, context->size, &context->signature );
+    if (FAILED( hr = export_proof_key_jwk( user->signing_key, &proof_key_json ) ))
+    {
+        free( method );
+        if (!context->utf16) free( url_w );
+        FIXME( "export_proof_key_jwk failed %#lx\n", hr );
+        XUSER_RETURN_HR_WHERE( "export_proof_key_jwk", hr );
+    }
+    if (FAILED( hr = RequestXstsTokenForUrlWithProofKey( user->user_token,
+                                                         context->utf16 ? context->url_utf16 : url_w,
+                                                         proof_key_json, &request_xsts, &request_user_hash ) ))
+    {
+        free( proof_key_json );
+        free( method );
+        if (!context->utf16) free( url_w );
+        FIXME( "RequestXstsTokenForUrlWithProofKey failed %#lx\n", hr );
+        XUSER_RETURN_HR_WHERE( "RequestXstsTokenForUrlWithProofKey", hr );
+    }
+    free( proof_key_json );
+    if (FAILED( hr = hstring_to_nul_string( request_xsts, &request_xsts_str ) ))
+    {
+        WindowsDeleteString( request_xsts );
+        WindowsDeleteString( request_user_hash );
+        free( method );
+        if (!context->utf16) free( url_w );
+        XUSER_RETURN_HR_WHERE( "request_xsts_str", hr );
+    }
+    WindowsDeleteString( request_xsts );
+    if (FAILED( hr = hstring_to_nul_string( request_user_hash, &request_user_hash_str ) ))
+    {
+        free( request_xsts_str );
+        WindowsDeleteString( request_user_hash );
+        free( method );
+        if (!context->utf16) free( url_w );
+        XUSER_RETURN_HR_WHERE( "request_user_hash_str", hr );
+    }
+    WindowsDeleteString( request_user_hash );
+    if (FAILED( hr = create_authorization_string( request_user_hash_str, request_xsts_str,
+                                                  !!(context->options & XUserGetTokenAndSignatureOptions_AllUsers),
+                                                  &context->authorization ) ))
+    {
+        free( request_user_hash_str );
+        free( request_xsts_str );
+        free( method );
+        if (!context->utf16) free( url_w );
+        XUSER_RETURN_HR_WHERE( "create_authorization_string", hr );
+    }
+    free( request_user_hash_str );
+    free( request_xsts_str );
+
+    if (!(context->token = strdup( context->authorization ? context->authorization : "" )))
+    {
+        free( method );
+        if (!context->utf16) free( url_w );
+        FIXME( "token strdup failed\n" );
+        XUSER_RETURN_HR_WHERE( "token strdup", E_OUTOFMEMORY );
+    }
+
+    if (context->utf16)
+    {
+        if (FAILED( hr = utf16_headers_to_utf8( context->headers_utf16, context->count, &utf8_headers ) ))
+        {
+            free( method );
+            XUSER_RETURN_HR_WHERE( "utf16_headers_to_utf8", hr );
+        }
+        hr = sign_request( user, context->authorization, method, url_w, context->count, utf8_headers,
+                           context->buffer, context->size, &context->signature );
+        for (SIZE_T i = 0; i < context->count; ++i)
+        {
+            free( (void *)utf8_headers[i].name );
+            free( (void *)utf8_headers[i].value );
+        }
+        free( utf8_headers );
+    }
+    else
+    {
+        hr = sign_request( user, context->authorization, method, url_w, context->count, context->headers,
+                           context->buffer, context->size, &context->signature );
+    }
     free( method );
     if (!context->utf16) free( url_w );
     if (FAILED( hr ))
@@ -927,17 +1292,18 @@ static HRESULT token_context_get_result( struct XUserGetTokenAndSignatureContext
 
         cursor += sizeof( *data );
         data->token = (LPCWSTR)cursor;
-        data->tokenCount = wcslen( context->token_utf16 ) + 1;
+        data->tokenCount = wcslen( context->token_utf16 );
         memcpy( cursor, context->token_utf16, token_bytes );
         cursor += token_bytes;
         if (context->signature_utf16)
         {
             data->signature = (LPCWSTR)cursor;
-            data->signatureCount = wcslen( context->signature_utf16 ) + 1;
+            data->signatureCount = wcslen( context->signature_utf16 );
             memcpy( cursor, context->signature_utf16, signature_bytes );
         }
         else
         {
+            __debug_check(1);
             data->signature = NULL;
             data->signatureCount = 0;
         }
@@ -950,17 +1316,18 @@ static HRESULT token_context_get_result( struct XUserGetTokenAndSignatureContext
 
         cursor += sizeof( *data );
         data->token = (LPCSTR)cursor;
-        data->tokenSize = token_bytes;
+        data->tokenSize = token_bytes - 1;
         memcpy( cursor, context->token, token_bytes );
         cursor += token_bytes;
         if (context->signature)
         {
             data->signature = (LPCSTR)cursor;
-            data->signatureSize = signature_bytes;
+            data->signatureSize = signature_bytes - 1;
             memcpy( cursor, context->signature, signature_bytes );
         }
         else
         {
+            __debug_check(1);
             data->signature = NULL;
             data->signatureSize = 0;
         }
@@ -1001,12 +1368,18 @@ static HRESULT XUserGetTokenAndSignatureProvider( XAsyncOp operation, const XAsy
         case Cleanup:
             if (context->count)
             {
-                if (context->utf16) free( context->headers_utf16 );
-                else free( context->headers );
+                if (context->utf16) free_utf16_headers( context->headers_utf16, context->count );
+                else free_ansi_headers( context->headers, context->count );
             }
+            free( context->buffer );
+            free( context->authorization );
+            free( context->method );
+            free( context->method_utf16 );
             free( context->token );
             free( context->signature );
             free( context->token_utf16 );
+            free( context->url );
+            free( context->url_utf16 );
             free( context->signature_utf16 );
             free( context );
             break;
@@ -1036,22 +1409,40 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureAsync( IXUserImpl *iface, 
     }
 
     context->options = options;
-    context->buffer = buffer;
-    context->method = method;
     context->count = count;
     context->utf16 = FALSE;
     context->size = size;
     context->user = user;
-    context->url = url;
-    if (count && !(context->headers = calloc( count, sizeof( *headers ) )))
+    if (!(context->method = strdup( method )))
     {
         free( context );
         impl->lpVtbl->Release( impl );
-        XUSER_RETURN_HR_WHERE( "headers calloc", E_OUTOFMEMORY );
+        XUSER_RETURN_HR_WHERE( "method strdup", E_OUTOFMEMORY );
     }
-
-    for (SIZE_T i = 0; i < count; i++)
-        context->headers[i] = headers[i];
+    if (!(context->url = strdup( url )))
+    {
+        free( context->method );
+        free( context );
+        impl->lpVtbl->Release( impl );
+        XUSER_RETURN_HR_WHERE( "url strdup", E_OUTOFMEMORY );
+    }
+    if (FAILED( hr = copy_ansi_headers( context, headers ) ))
+    {
+        free( context->url );
+        free( context->method );
+        free( context );
+        impl->lpVtbl->Release( impl );
+        XUSER_RETURN_HR_WHERE( "copy_ansi_headers", hr );
+    }
+    if (FAILED( hr = copy_request_buffer( context, buffer, size ) ))
+    {
+        free_ansi_headers( context->headers, context->count );
+        free( context->url );
+        free( context->method );
+        free( context );
+        impl->lpVtbl->Release( impl );
+        XUSER_RETURN_HR_WHERE( "copy_request_buffer", hr );
+    }
 
     FIXME( "iface %p, user %p, options %d, method %s, url %s, count %llu, headers %p, size %llu, buffer %p, asyncBlock %p\n", iface, user, options, method, url, count, headers, size, buffer, asyncBlock );
     hr = impl->lpVtbl->XAsyncBegin( impl, asyncBlock, context, x_user_XUserGetTokenAndSignatureAsync, "XUserGetTokenAndSignatureAsync", XUserGetTokenAndSignatureProvider );
@@ -1068,7 +1459,8 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureResultSize( IXUserImpl *if
     if (!asyncBlock || !size) XUSER_RETURN_HR_WHERE( "args", E_POINTER );
     if (FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) XUSER_RETURN_HR_WHERE( "QueryApiImpl", E_FAIL );
     hr = impl->lpVtbl->XAsyncGetResultSize( impl, asyncBlock, size );
-    TRACE( "XAsyncGetResultSize returned %#lx, size %Iu\n", hr, *size );
+    FIXME( "XAsyncGetResultSize returned %#lx, size %Iu\n", hr, *size );
+    if(FAILED(hr)) __debug_check(hr);
     XUSER_RETURN_HR_WHERE( "XAsyncGetResultSize", hr );
 }
 
@@ -1084,8 +1476,9 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureResult( IXUserImpl *iface,
     hr = impl->lpVtbl->XAsyncGetResult( impl, asyncBlock, x_user_XUserGetTokenAndSignatureAsync, size, buffer, used );
     if (SUCCEEDED( hr )) {
         *ptr = buffer;
+        __debug_check(1);
         //FIXME("TOKEN %s | SIG %s", (*ptr)->token, (*ptr)->signature);
-        FIXME("OK");
+        FIXME("OK\n");
     } else {
         FIXME("FAILED");
     }
@@ -1109,23 +1502,41 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Async( IXUserImpl *if
         XUSER_RETURN_HR_WHERE( "context calloc", E_OUTOFMEMORY );
     }
 
-    context->method_utf16 = method;
     context->options = options;
-    context->buffer = buffer;
-    context->url_utf16 = url;
     context->count = count;
     context->utf16 = TRUE;
     context->size = size;
     context->user = user;
-    if (count && !(context->headers_utf16 = calloc( count, sizeof( *headers ) )))
+    if (FAILED( hr = wide_strdup( method, &context->method_utf16 ) ))
     {
         free( context );
         impl->lpVtbl->Release( impl );
-        XUSER_RETURN_HR_WHERE( "headers calloc", E_OUTOFMEMORY );
+        XUSER_RETURN_HR_WHERE( "method wide strdup", hr );
     }
-
-    for (SIZE_T i = 0; i < count; i++)
-        context->headers_utf16[i] = headers[i];
+    if (FAILED( hr = wide_strdup( url, &context->url_utf16 ) ))
+    {
+        free( context->method_utf16 );
+        free( context );
+        impl->lpVtbl->Release( impl );
+        XUSER_RETURN_HR_WHERE( "url wide strdup", hr );
+    }
+    if (FAILED( hr = copy_utf16_headers( context, headers ) ))
+    {
+        free( context->url_utf16 );
+        free( context->method_utf16 );
+        free( context );
+        impl->lpVtbl->Release( impl );
+        XUSER_RETURN_HR_WHERE( "copy_utf16_headers", hr );
+    }
+    if (FAILED( hr = copy_request_buffer( context, buffer, size ) ))
+    {
+        free_utf16_headers( context->headers_utf16, context->count );
+        free( context->url_utf16 );
+        free( context->method_utf16 );
+        free( context );
+        impl->lpVtbl->Release( impl );
+        XUSER_RETURN_HR_WHERE( "copy_request_buffer", hr );
+    }
 
     hr = impl->lpVtbl->XAsyncBegin( impl, asyncBlock, context, x_user_XUserGetTokenAndSignatureUtf16Async, "XUserGetTokenAndSignatureUtf16Async", XUserGetTokenAndSignatureProvider );
     impl->lpVtbl->Release( impl );

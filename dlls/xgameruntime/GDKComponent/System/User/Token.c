@@ -162,6 +162,109 @@ static HRESULT HttpRequest( LPCWSTR method, LPCWSTR domain, LPCWSTR object, LPST
     return hr;
 }
 
+static BOOL ends_with_a( LPCSTR str, LPCSTR suffix )
+{
+    SIZE_T str_len = strlen( str );
+    SIZE_T suffix_len = strlen( suffix );
+
+    return str_len >= suffix_len && !strcmp( str + str_len - suffix_len, suffix );
+}
+
+static void sanitize_env_component( LPCSTR src, LPSTR dst, SIZE_T dst_size )
+{
+    SIZE_T i;
+
+    if (!dst_size) return;
+    for (i = 0; i + 1 < dst_size && src[i]; ++i)
+    {
+        char c = src[i];
+
+        if (isalnum( (unsigned char)c )) dst[i] = toupper( (unsigned char)c );
+        else dst[i] = '_';
+    }
+    dst[i] = 0;
+}
+
+static HRESULT get_relying_party_override( LPCSTR host, LPSTR *relying_party )
+{
+    char env_name[256], sanitized_host[128];
+    DWORD len;
+
+    *relying_party = NULL;
+    sanitize_env_component( host, sanitized_host, sizeof( sanitized_host ) );
+    snprintf( env_name, sizeof( env_name ), "WINEGDK_XSTS_RP_%s", sanitized_host );
+    len = GetEnvironmentVariableA( env_name, NULL, 0 );
+    if (!len) len = GetEnvironmentVariableA( "WINEGDK_XSTS_RP", NULL, 0 );
+    if (!len) return HRESULT_FROM_WIN32( ERROR_ENVVAR_NOT_FOUND );
+
+    if (!(*relying_party = calloc( len, sizeof( CHAR ) ))) return E_OUTOFMEMORY;
+    if (!GetEnvironmentVariableA( env_name, *relying_party, len ) &&
+        !GetEnvironmentVariableA( "WINEGDK_XSTS_RP", *relying_party, len ))
+    {
+        free( *relying_party );
+        *relying_party = NULL;
+        return HRESULT_FROM_WIN32( GetLastError() );
+    }
+    return S_OK;
+}
+
+static HRESULT get_relying_party_for_url( LPCWSTR url, LPSTR *relying_party )
+{
+    URL_COMPONENTSW components = {0};
+    LPSTR host = NULL, scheme = NULL;
+    HRESULT hr = S_OK;
+    DWORD host_len, scheme_len;
+
+    *relying_party = NULL;
+    components.dwStructSize = sizeof( components );
+    components.dwHostNameLength = -1;
+    components.dwSchemeLength = -1;
+    if (!WinHttpCrackUrl( url, 0, 0, &components )) return HRESULT_FROM_WIN32( GetLastError() );
+
+    host_len = WideCharToMultiByte( CP_UTF8, 0, components.lpszHostName, components.dwHostNameLength, NULL, 0, NULL, NULL );
+    scheme_len = WideCharToMultiByte( CP_UTF8, 0, components.lpszScheme, components.dwSchemeLength, NULL, 0, NULL, NULL );
+    if (!host_len || !scheme_len) return HRESULT_FROM_WIN32( GetLastError() );
+    if (!(host = calloc( host_len + 1, sizeof( CHAR ) )) || !(scheme = calloc( scheme_len + 1, sizeof( CHAR ) )))
+    {
+        hr = E_OUTOFMEMORY;
+        goto done;
+    }
+    WideCharToMultiByte( CP_UTF8, 0, components.lpszHostName, components.dwHostNameLength, host, host_len + 1, NULL, NULL );
+    WideCharToMultiByte( CP_UTF8, 0, components.lpszScheme, components.dwSchemeLength, scheme, scheme_len + 1, NULL, NULL );
+
+    if (SUCCEEDED( get_relying_party_override( host, relying_party ) )) goto done;
+
+    if (!strcmp( host, "collections.mp.microsoft.com" ) ||
+        !strcmp( host, "purchase.mp.microsoft.com" ) ||
+        !strcmp( host, "inventory.xboxlive.com" ) ||
+        !strcmp( host, "licensing.xboxlive.com" ))
+    {
+        *relying_party = strdup( "http://licensing.xboxlive.com" );
+    }
+    else if (ends_with_a( host, ".xboxlive.com" ) || !strcmp( host, "xboxlive.com" ))
+    {
+        *relying_party = strdup( "http://xboxlive.com" );
+    }
+    else
+    {
+        SIZE_T size = strlen( scheme ) + strlen( host ) + strlen( ":///" ) + 1;
+
+        if (!(*relying_party = calloc( size, sizeof( CHAR ) )))
+        {
+            hr = E_OUTOFMEMORY;
+            goto done;
+        }
+        snprintf( *relying_party, size, "%s://%s/", scheme, host );
+    }
+
+    if (!*relying_party) hr = E_OUTOFMEMORY;
+
+done:
+    free( host );
+    free( scheme );
+    return hr;
+}
+
 static HRESULT ParseJsonObject( LPCSTR str, UINT32 str_size, IJsonObject **object )
 {
     LPCWSTR class_str = RuntimeClass_Windows_Data_Json_JsonValue;
@@ -1067,6 +1170,79 @@ HRESULT RequestXstsTokenWithUserHash( HSTRING user_token, HSTRING *token, HSTRIN
         return E_FAIL;
     }
 
+    return hr;
+}
+
+HRESULT RequestXstsTokenForUrlWithProofKey( HSTRING user_token, LPCWSTR url, LPCSTR proof_key,
+                                            HSTRING *token, HSTRING *user_hash )
+{
+    LPCWSTR accept[] = {L"application/json", NULL};
+    const char *template = "{\"RelyingParty\":\"%s\",\"TokenType\":\"JWT\",\"Properties\":{\"SandboxId\":\"RETAIL\",\"UserTokens\":[\"%s\"]},\"ProofKey\":%s}";
+    UINT32 token_str_len;
+    LPSTR relying_party = NULL, token_str = NULL, data = NULL, buffer = NULL;
+    IJsonObject *display_claims = NULL, *root = NULL, *user = NULL;
+    IJsonArray *xui = NULL;
+    SIZE_T size;
+    HRESULT hr;
+    size_t data_size;
+
+    *token = NULL;
+    *user_hash = NULL;
+
+    if (FAILED( hr = get_relying_party_for_url( url, &relying_party ) )) return hr;
+    if (FAILED( hr = HSTRINGToMultiByte( user_token, &token_str, &token_str_len ) ))
+    {
+        free( relying_party );
+        return hr;
+    }
+
+    data_size = snprintf( NULL, 0, template, relying_party, token_str, proof_key ) + 1;
+    if (!(data = calloc( data_size, sizeof( CHAR ) )))
+    {
+        free( relying_party );
+        free( token_str );
+        return E_OUTOFMEMORY;
+    }
+    snprintf( data, data_size, template, relying_party, token_str, proof_key );
+    FIXME( "RequestXstsTokenForUrlWithProofKey relying party %s for %s\n", debugstr_a( relying_party ), debugstr_w( url ) );
+
+    hr = HttpRequest(
+        L"POST",
+        L"xsts.auth.xboxlive.com",
+        L"/xsts/authorize",
+        data,
+        L"content-type: application/json",
+        accept,
+        &buffer,
+        &size
+    );
+
+    free( relying_party );
+    free( token_str );
+    free( data );
+    if (FAILED( hr )) return hr;
+    hr = ParseJsonObject( buffer, size, &root );
+    free( buffer );
+    if (FAILED( hr )) return hr;
+
+    if (FAILED( hr = GetJsonStringValue( root, L"Token", token ) )) goto failed;
+    if (FAILED( hr = GetJsonObjectValue( root, L"DisplayClaims", &display_claims ) )) goto failed;
+    if (FAILED( hr = GetJsonArrayValue( display_claims, L"xui", &xui ) )) goto failed;
+    if (FAILED( hr = IJsonArray_GetObjectAt( xui, 0, &user ) )) goto failed;
+    hr = GetJsonStringValue( user, L"uhs", user_hash );
+
+failed:
+    if (root) IJsonObject_Release( root );
+    if (display_claims) IJsonObject_Release( display_claims );
+    if (xui) IJsonArray_Release( xui );
+    if (user) IJsonObject_Release( user );
+    if (FAILED( hr ))
+    {
+        if (*token) WindowsDeleteString( *token );
+        *token = NULL;
+        if (*user_hash) WindowsDeleteString( *user_hash );
+        *user_hash = NULL;
+    }
     return hr;
 }
 
