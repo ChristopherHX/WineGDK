@@ -29,7 +29,6 @@ import "windowscontracts.idl";
 import "windows.system.idl";
 import "windows.ui.text.core.idl";
 import "windows.ui.viewmanagement.core.idl";
-import "windows.ui.text.core.idl";
 
 namespace Windows.UI {
 

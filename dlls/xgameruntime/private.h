@@ -56,8 +56,14 @@
 #include <xasync.h>
 #include <xasyncprovider.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 #include "wine/unixlib.h"
 #include "wine/debug.h"
+#ifdef __cplusplus
+}
+#endif
 
 #define WIDL_using_Windows_Foundation
 #define WIDL_using_Windows_Foundation_Collections
@@ -106,14 +112,20 @@ extern char *msaAppId;
 extern UINT32 titleId;
 extern BOOLEAN fullTrust;
 
-extern IXThreadingImpl *x_threading_impl;
-extern IXGameRuntimeFeatureImpl *x_game_runtime_feature;
-extern IXSystemImpl *x_system;
-extern IXSystemAnalyticsImpl *x_system_analytics;
-extern IXNetworkingImpl *x_networking;
-extern IXGameImpl *x_game;
-extern IXUserImpl6 *x_user;
-extern IXUserDeviceImpl *x_user_device;
+#ifdef __cplusplus
+#define EXTERN extern "C"
+#else
+#define EXTERN extern
+#endif
+EXTERN IXThreadingImpl *x_threading_impl;
+EXTERN IXGameRuntimeFeatureImpl *x_game_runtime_feature;
+EXTERN IXSystemImpl *x_system;
+EXTERN IXSystemAnalyticsImpl *x_system_analytics;
+EXTERN IXNetworkingImpl *x_networking;
+EXTERN IXGameImpl *x_game;
+EXTERN IXUserImpl6 *x_user;
+EXTERN IXUserDeviceImpl *x_user_device;
+#undef EXTERN
 
 #ifdef __cplusplus
 extern ABI::Xodus::IIPCLayer *xodus_ipclayer;
@@ -147,8 +159,14 @@ enum unix_funcs
     send_frame
 };
 
-extern unixlib_module_t unixlib;
-extern unixlib_handle_t unixhandle;
+#ifdef __cplusplus
+#define EXTERN extern "C"
+#else
+#define EXTERN extern
+#endif
+EXTERN unixlib_module_t unixlib;
+EXTERN unixlib_handle_t unixhandle;
+#undef EXTERN
 
 typedef HRESULT (WINAPI *async_operation_callback)( IUnknown *invoker, PVOID param, PROPVARIANT *result );
 
