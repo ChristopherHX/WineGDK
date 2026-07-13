@@ -116,6 +116,14 @@ struct ldr_notification
 };
 
 static struct list ldr_notifications = LIST_INIT( ldr_notifications );
+static struct list protected_dlls = LIST_INIT( protected_dlls );
+
+struct protected_dll
+{
+    struct list    entry;
+    UNICODE_STRING nt_name;
+    HANDLE         handle;
+};
 
 static const char * const reason_names[] =
 {
@@ -198,6 +206,8 @@ static FARPROC find_ordinal_export( HMODULE module, const IMAGE_EXPORT_DIRECTORY
 static FARPROC find_named_export( HMODULE module, const IMAGE_EXPORT_DIRECTORY *exports, DWORD exp_size,
                                   const char *name, int hint, LPCWSTR load_path,
                                   WINE_MODREF *importer, BOOL is_dynamic );
+NTSTATUS CDECL wine_server_fd_to_handle( int fd, unsigned int access, unsigned int attributes,
+                                         HANDLE *handle );
 
 /* check whether the file name contains a path */
 static inline BOOL contains_path( LPCWSTR name )
@@ -2520,6 +2530,132 @@ static BOOL is_valid_binary( HANDLE file, const SECTION_IMAGE_INFORMATION *info 
 #endif  /* _WIN64 */
 
 
+/***********************************************************************
+ *           find_protected_dll
+ *
+ * The loader_section must be locked while calling this function.
+ */
+static struct protected_dll *find_protected_dll( const UNICODE_STRING *nt_name )
+{
+    struct protected_dll *dll;
+
+    LIST_FOR_EACH_ENTRY( dll, &protected_dlls, struct protected_dll, entry )
+    {
+        if (RtlEqualUnicodeString( &dll->nt_name, nt_name, TRUE )) return dll;
+    }
+    return NULL;
+}
+
+
+/***********************************************************************
+ *           get_protected_dll_handle
+ *
+ * The loader_section must be locked while calling this function.
+ */
+static NTSTATUS get_protected_dll_handle( const UNICODE_STRING *nt_name, HANDLE *handle )
+{
+    struct protected_dll *dll;
+
+    *handle = NULL;
+    if (!(dll = find_protected_dll( nt_name ))) return STATUS_DLL_NOT_FOUND;
+
+    return NtDuplicateObject( NtCurrentProcess(), dll->handle, NtCurrentProcess(), handle, 0, 0,
+                              DUPLICATE_SAME_ACCESS );
+}
+
+
+/***********************************************************************
+ *           set_protected_dll_handle
+ *
+ * The loader_section must be locked while calling this function.
+ */
+static NTSTATUS set_protected_dll_handle( const UNICODE_STRING *nt_name, HANDLE handle )
+{
+    struct protected_dll *dll = find_protected_dll( nt_name );
+    HANDLE dup_handle = NULL;
+    NTSTATUS status;
+
+    if (handle &&
+        (status = NtDuplicateObject( NtCurrentProcess(), handle, NtCurrentProcess(), &dup_handle, 0, 0,
+                                     DUPLICATE_SAME_ACCESS )))
+        return status;
+
+    if (dll)
+    {
+        NtClose( dll->handle );
+        dll->handle = NULL;
+
+        if (!dup_handle)
+        {
+            list_remove( &dll->entry );
+            RtlFreeHeap( GetProcessHeap(), 0, dll->nt_name.Buffer );
+            RtlFreeHeap( GetProcessHeap(), 0, dll );
+            return STATUS_SUCCESS;
+        }
+
+        dll->handle = dup_handle;
+        return STATUS_SUCCESS;
+    }
+
+    if (!dup_handle) return STATUS_SUCCESS;
+
+    if (!(dll = RtlAllocateHeap( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*dll) )))
+    {
+        NtClose( dup_handle );
+        return STATUS_NO_MEMORY;
+    }
+
+    dll->nt_name.MaximumLength = nt_name->Length + sizeof(WCHAR);
+    if (!(dll->nt_name.Buffer = RtlAllocateHeap( GetProcessHeap(), 0, dll->nt_name.MaximumLength )))
+    {
+        NtClose( dup_handle );
+        RtlFreeHeap( GetProcessHeap(), 0, dll );
+        return STATUS_NO_MEMORY;
+    }
+
+    memcpy( dll->nt_name.Buffer, nt_name->Buffer, nt_name->Length );
+    dll->nt_name.Buffer[nt_name->Length / sizeof(WCHAR)] = 0;
+    dll->nt_name.Length = nt_name->Length;
+    dll->handle = dup_handle;
+    list_add_tail( &protected_dlls, &dll->entry );
+    return STATUS_SUCCESS;
+}
+
+
+/***********************************************************************
+ *           open_dll_handle
+ */
+static NTSTATUS open_dll_handle( const UNICODE_STRING *nt_name, WINE_MODREF **pwm, HANDLE *mapping,
+                                 SECTION_IMAGE_INFORMATION *image_info, struct file_id *id )
+{
+    LARGE_INTEGER size;
+    NTSTATUS status;
+    HANDLE handle;
+
+    if ((*pwm = find_fullname_module( nt_name ))) return STATUS_SUCCESS;
+    if ((status = get_protected_dll_handle( nt_name, &handle ))) return status;
+
+    memset( id, 0, sizeof(*id) );
+    size.QuadPart = 0;
+    status = NtCreateSection( mapping, STANDARD_RIGHTS_REQUIRED | SECTION_QUERY |
+                              SECTION_MAP_READ | SECTION_MAP_EXECUTE,
+                              NULL, &size, PAGE_EXECUTE_READ, SEC_IMAGE, handle );
+    if (!status)
+    {
+        NtQuerySection( *mapping, SectionImageInformation, image_info, sizeof(*image_info), NULL );
+        if (!is_valid_binary( handle, image_info ))
+        {
+            TRACE( "%s is for arch %x, continuing search\n", debugstr_us(nt_name), image_info->Machine );
+            status = STATUS_NOT_SUPPORTED;
+            NtClose( *mapping );
+            *mapping = NULL;
+        }
+    }
+    NtClose( handle );
+    return status;
+}
+
+
 /******************************************************************
  *		get_module_path_end
  *
@@ -2689,7 +2825,8 @@ static NTSTATUS open_dll_file( UNICODE_STRING *nt_name, WINE_MODREF **pwm, HANDL
     NTSTATUS status;
     HANDLE handle;
 
-    if ((*pwm = find_fullname_module( nt_name ))) return STATUS_SUCCESS;
+    status = open_dll_handle( nt_name, pwm, mapping, image_info, id );
+    if (status != STATUS_DLL_NOT_FOUND) return status;
 
     InitializeObjectAttributes( &attr, nt_name, OBJ_CASE_INSENSITIVE, 0, NULL );
     if ((status = NtOpenFile( &handle, GENERIC_READ | SYNCHRONIZE, &attr, &io,
@@ -3120,6 +3257,74 @@ static NTSTATUS get_env_var( const WCHAR *name, SIZE_T extra, UNICODE_STRING *re
         }
         size = len + 1 + extra;
     }
+}
+
+
+/***********************************************************************
+ *           init_protected_dlls_from_env
+ *
+ * Parse WINE_DLL_FILE_MAP entries in the form:
+ *   <fd>:<nt_name>|<fd>:<nt_name>|...
+ * Each fd must refer to an inherited Unix file descriptor for the backing
+ * image object, and each nt_name is the synthetic NT path to resolve.
+ *
+ * The loader_section must be locked while calling this function.
+ */
+static void init_protected_dlls_from_env(void)
+{
+    static const WCHAR env_name[] = L"WINE_DLL_FILE_MAP";
+    UNICODE_STRING value, nt_name;
+    const WCHAR *entry, *sep, *end;
+    NTSTATUS status;
+
+    if (get_env_var( env_name, 0, &value )) return;
+
+    for (entry = value.Buffer; *entry; entry = *end ? end + 1 : end)
+    {
+        HANDLE handle;
+        ULONG fd = 0;
+        const WCHAR *p;
+
+        end = wcschr( entry, L'|' );
+        if (!end) end = entry + wcslen( entry );
+        if (end == entry) continue;
+
+        sep = wcschr( entry, L':' );
+        if (!sep || sep >= end)
+        {
+            WARN( "ignoring malformed %s entry %s\n", debugstr_w(env_name), debugstr_wn(entry, end - entry) );
+            continue;
+        }
+
+        for (p = entry; p < sep; p++)
+        {
+            if (*p < '0' || *p > '9')
+            {
+                WARN( "ignoring malformed fd in %s entry %s\n",
+                      debugstr_w(env_name), debugstr_wn(entry, end - entry) );
+                fd = ~0u;
+                break;
+            }
+            fd = fd * 10 + (*p - '0');
+        }
+        if (fd == ~0u || sep == entry || sep + 1 == end) continue;
+
+        nt_name.Buffer = (WCHAR *)(sep + 1);
+        nt_name.Length = nt_name.MaximumLength = (end - sep - 1) * sizeof(WCHAR);
+
+        if ((status = wine_server_fd_to_handle( fd, GENERIC_READ | SYNCHRONIZE, 0, &handle )))
+        {
+            WARN( "failed to import fd %lu for %s, status %#lx\n", fd, debugstr_us(&nt_name), status );
+            continue;
+        }
+
+        status = set_protected_dll_handle( &nt_name, handle );
+        NtClose( handle );
+        if (status) WARN( "failed to register %s from fd %lu, status %#lx\n",
+                          debugstr_us(&nt_name), fd, status );
+    }
+
+    RtlFreeHeap( GetProcessHeap(), 0, value.Buffer );
 }
 
 
@@ -4465,6 +4670,7 @@ void loader_init( CONTEXT *context, void **entry )
         load_global_options();
         version_init();
         open_known_dll_ntdir();
+        init_protected_dlls_from_env();
 
         default_load_path = peb->ProcessParameters->DllPath.Buffer;
         if (!default_load_path)
