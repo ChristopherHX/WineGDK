@@ -50,18 +50,18 @@ static int create_shared_backing( void )
     if (fd != -1) return fd;
 #endif
 
-    {
-        const char *tmpdir = getenv( "TMPDIR" );
-        char path[PATH_MAX];
-        int fd;
+    // {
+    //     const char *tmpdir = getenv( "TMPDIR" );
+    //     char path[PATH_MAX];
+    //     int fd;
 
-        if (!tmpdir || !tmpdir[0]) tmpdir = "/tmp";
-        snprintf( path, sizeof(path), "%s/%s", tmpdir, "wine-dll-file-map-XXXXXX" );
-        fd = mkstemp( path );
-        if (fd == -1) return -1;
-        unlink( path );
-        return fd;
-    }
+    //     if (!tmpdir || !tmpdir[0]) tmpdir = "/tmp";
+    //     snprintf( path, sizeof(path), "%s/%s", tmpdir, "wine-dll-file-map-XXXXXX" );
+    //     fd = mkstemp( path );
+    //     if (fd == -1) return -1;
+    //     unlink( path );
+    //     return fd;
+    // }
 
     errno = ENOSYS;
     return -1;
