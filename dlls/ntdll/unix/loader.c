@@ -129,7 +129,6 @@ const char **dll_paths = NULL;
 const char **system_dll_paths = NULL;
 const char *user_name = NULL;
 SECTION_IMAGE_INFORMATION main_image_info = { NULL };
-NTSTATUS CDECL wine_server_fd_to_handle( int fd, unsigned int access, unsigned int attributes, HANDLE *handle );
 
 /* die on a fatal error; use only during initialization */
 static void fatal_error( const char *err, ... )
@@ -1061,74 +1060,6 @@ static inline char *prepend_build_dir_path( char *ptr, const char *ext, const ch
 
 
 /***********************************************************************
- *           ascii_unicode_path_equals
- */
-static BOOL ascii_unicode_path_equals( const char *ascii, size_t len, const UNICODE_STRING *unicode )
-{
-    size_t i, unicode_len = unicode->Length / sizeof(WCHAR);
-
-    if (len != unicode_len) return FALSE;
-    for (i = 0; i < len; i++)
-    {
-        if ((unsigned char)ascii[i] != unicode->Buffer[i]) return FALSE;
-    }
-    return TRUE;
-}
-
-
-/***********************************************************************
- *           open_mapped_dll_file
- */
-static NTSTATUS open_mapped_dll_file( const UNICODE_STRING *nt_name, HANDLE *mapping )
-{
-    const char *value = getenv( "WINE_DLL_FILE_MAP" );
-    const char *entry, *sep, *end;
-
-    if (!value || !*value) return STATUS_DLL_NOT_FOUND;
-
-    for (entry = value; *entry; entry = *end ? end + 1 : end)
-    {
-        HANDLE handle;
-        LARGE_INTEGER size;
-        NTSTATUS status;
-        int fd = 0;
-        const char *p;
-
-        end = strchr( entry, '|' );
-        if (!end) end = entry + strlen( entry );
-        if (end == entry) continue;
-
-        sep = strchr( entry, ':' );
-        if (!sep || sep >= end) continue;
-
-        for (p = entry; p < sep; p++)
-        {
-            if (*p < '0' || *p > '9')
-            {
-                fd = -1;
-                break;
-            }
-            fd = fd * 10 + (*p - '0');
-        }
-        if (fd < 0 || sep == entry || sep + 1 == end) continue;
-        if (!ascii_unicode_path_equals( sep + 1, end - sep - 1, nt_name )) continue;
-
-        if ((status = wine_server_fd_to_handle( fd, GENERIC_READ | SYNCHRONIZE, 0, &handle )))
-            return status;
-
-        size.QuadPart = 0;
-        status = NtCreateSection( mapping, STANDARD_RIGHTS_REQUIRED | SECTION_QUERY |
-                                  SECTION_MAP_READ | SECTION_MAP_EXECUTE,
-                                  NULL, &size, PAGE_EXECUTE_READ, SEC_IMAGE, handle );
-        NtClose( handle );
-        return status;
-    }
-
-    return STATUS_DLL_NOT_FOUND;
-}
-
-
-/***********************************************************************
  *	open_dll_file
  *
  * Open a file for a new dll. Helper for open_builtin_pe_file.
@@ -1138,9 +1069,6 @@ static NTSTATUS open_dll_file( const char *name, OBJECT_ATTRIBUTES *attr, HANDLE
     LARGE_INTEGER size;
     NTSTATUS status;
     HANDLE handle;
-
-    if (attr->ObjectName && (status = open_mapped_dll_file( attr->ObjectName, mapping )) != STATUS_DLL_NOT_FOUND)
-        return status;
 
     if ((status = open_unix_file( &handle, name, GENERIC_READ | SYNCHRONIZE, attr, 0,
                                   FILE_SHARE_READ | FILE_SHARE_DELETE, FILE_OPEN,
@@ -1425,7 +1353,6 @@ static NTSTATUS open_main_image( UNICODE_STRING *nt_name, void **module, SECTION
                                  enum loadorder loadorder, USHORT machine )
 {
     OBJECT_ATTRIBUTES attr;
-    OBJECT_ATTRIBUTES true_attr;
     SIZE_T size = 0;
     char *unix_name;
     NTSTATUS status;
@@ -1435,24 +1362,9 @@ static NTSTATUS open_main_image( UNICODE_STRING *nt_name, void **module, SECTION
     if (loadorder == LO_DISABLED) NtTerminateProcess( GetCurrentProcess(), STATUS_DLL_NOT_FOUND );
 
     InitializeObjectAttributes( &attr, nt_name, OBJ_CASE_INSENSITIVE, 0, NULL );
-    status = open_mapped_dll_file( nt_name, &mapping );
-    if (!status)
-    {
-        status = virtual_map_module( mapping, module, &size, info, 0, 0, machine );
-        if (status == STATUS_IMAGE_MACHINE_TYPE_MISMATCH && info->ComPlusNativeReady)
-        {
-            info->Machine = native_machine;
-            status = STATUS_SUCCESS;
-        }
-        NtClose( mapping );
-        return status;
-    }
-    if (status != STATUS_DLL_NOT_FOUND) return status;
-
     if (get_nt_and_unix_names( &attr, &true_nt_name, &unix_name, FILE_OPEN, FALSE )) return STATUS_DLL_NOT_FOUND;
-    InitializeObjectAttributes( &true_attr, &true_nt_name, OBJ_CASE_INSENSITIVE, 0, NULL );
 
-    status = open_dll_file( unix_name, &true_attr, &mapping );
+    status = open_dll_file( unix_name, &attr, &mapping );
     if (!status)
     {
         status = virtual_map_module( mapping, module, &size, info, 0, 0, machine );
@@ -1465,7 +1377,7 @@ static NTSTATUS open_main_image( UNICODE_STRING *nt_name, void **module, SECTION
     }
     else if (status == STATUS_INVALID_IMAGE_NOT_MZ && loadorder != LO_NATIVE)
     {
-        status = open_main_image_so_file( unix_name, &true_nt_name, module, info );
+        status = open_main_image_so_file( unix_name, attr.ObjectName, module, info );
     }
     free( unix_name );
     free( true_nt_name.Buffer );
