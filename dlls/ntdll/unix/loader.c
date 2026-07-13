@@ -1425,7 +1425,7 @@ static NTSTATUS open_main_image( UNICODE_STRING *nt_name, void **module, SECTION
                                  enum loadorder loadorder, USHORT machine )
 {
     OBJECT_ATTRIBUTES attr;
-    OBJECT_ATTRIBUTES true_attr;
+    OBJECT_ATTRIBUTES *file_attr = &attr, true_attr;
     SIZE_T size = 0;
     char *unix_name;
     NTSTATUS status;
@@ -1450,9 +1450,13 @@ static NTSTATUS open_main_image( UNICODE_STRING *nt_name, void **module, SECTION
     if (status != STATUS_DLL_NOT_FOUND) return status;
 
     if (get_nt_and_unix_names( &attr, &true_nt_name, &unix_name, FILE_OPEN, FALSE )) return STATUS_DLL_NOT_FOUND;
-    InitializeObjectAttributes( &true_attr, &true_nt_name, OBJ_CASE_INSENSITIVE, 0, NULL );
+    if (true_nt_name.Buffer)
+    {
+        InitializeObjectAttributes( &true_attr, &true_nt_name, OBJ_CASE_INSENSITIVE, 0, NULL );
+        file_attr = &true_attr;
+    }
 
-    status = open_dll_file( unix_name, &true_attr, &mapping );
+    status = open_dll_file( unix_name, file_attr, &mapping );
     if (!status)
     {
         status = virtual_map_module( mapping, module, &size, info, 0, 0, machine );

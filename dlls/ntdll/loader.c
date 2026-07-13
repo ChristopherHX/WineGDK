@@ -2547,6 +2547,9 @@ static struct protected_dll *find_protected_dll( const UNICODE_STRING *nt_name )
 }
 
 
+static NTSTATUS import_protected_dll_from_env( const UNICODE_STRING *wanted_name );
+
+
 /***********************************************************************
  *           get_protected_dll_handle
  *
@@ -2555,9 +2558,14 @@ static struct protected_dll *find_protected_dll( const UNICODE_STRING *nt_name )
 static NTSTATUS get_protected_dll_handle( const UNICODE_STRING *nt_name, HANDLE *handle )
 {
     struct protected_dll *dll;
+    NTSTATUS status;
 
     *handle = NULL;
-    if (!(dll = find_protected_dll( nt_name ))) return STATUS_DLL_NOT_FOUND;
+    if (!(dll = find_protected_dll( nt_name )))
+    {
+        if ((status = import_protected_dll_from_env( nt_name ))) return status;
+        if (!(dll = find_protected_dll( nt_name ))) return STATUS_DLL_NOT_FOUND;
+    }
 
     return NtDuplicateObject( NtCurrentProcess(), dll->handle, NtCurrentProcess(), handle, 0, 0,
                               DUPLICATE_SAME_ACCESS );
@@ -3261,23 +3269,23 @@ static NTSTATUS get_env_var( const WCHAR *name, SIZE_T extra, UNICODE_STRING *re
 
 
 /***********************************************************************
- *           init_protected_dlls_from_env
+ *           import_protected_dll_from_env
  *
  * Parse WINE_DLL_FILE_MAP entries in the form:
  *   <fd>:<nt_name>|<fd>:<nt_name>|...
  * Each fd must refer to an inherited Unix file descriptor for the backing
- * image object, and each nt_name is the synthetic NT path to resolve.
+ * image object, and nt_name is the synthetic NT path to resolve.
  *
  * The loader_section must be locked while calling this function.
  */
-static void init_protected_dlls_from_env(void)
+static NTSTATUS import_protected_dll_from_env( const UNICODE_STRING *wanted_name )
 {
     static const WCHAR env_name[] = L"WINE_DLL_FILE_MAP";
     UNICODE_STRING value, nt_name;
     const WCHAR *entry, *sep, *end;
-    NTSTATUS status;
+    NTSTATUS status = STATUS_DLL_NOT_FOUND;
 
-    if (get_env_var( env_name, 0, &value )) return;
+    if (get_env_var( env_name, 0, &value )) return STATUS_DLL_NOT_FOUND;
 
     for (entry = value.Buffer; *entry; entry = *end ? end + 1 : end)
     {
@@ -3311,20 +3319,23 @@ static void init_protected_dlls_from_env(void)
 
         nt_name.Buffer = (WCHAR *)(sep + 1);
         nt_name.Length = nt_name.MaximumLength = (end - sep - 1) * sizeof(WCHAR);
+        if (!RtlEqualUnicodeString( &nt_name, wanted_name, TRUE )) continue;
 
         if ((status = wine_server_fd_to_handle( fd, GENERIC_READ | SYNCHRONIZE, 0, &handle )))
         {
             WARN( "failed to import fd %lu for %s, status %#lx\n", fd, debugstr_us(&nt_name), status );
-            continue;
+            break;
         }
 
         status = set_protected_dll_handle( &nt_name, handle );
         NtClose( handle );
         if (status) WARN( "failed to register %s from fd %lu, status %#lx\n",
                           debugstr_us(&nt_name), fd, status );
+        break;
     }
 
     RtlFreeHeap( GetProcessHeap(), 0, value.Buffer );
+    return status;
 }
 
 
@@ -4670,7 +4681,6 @@ void loader_init( CONTEXT *context, void **entry )
         load_global_options();
         version_init();
         open_known_dll_ntdir();
-        init_protected_dlls_from_env();
 
         default_load_path = peb->ProcessParameters->DllPath.Buffer;
         if (!default_load_path)
